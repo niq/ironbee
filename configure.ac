@@ -128,6 +128,21 @@ else
     IB_DEBUG=
 fi
 
+### CLI
+AC_ARG_ENABLE(cli,
+              AS_HELP_STRING([--enable-cli],
+                             [Enable the cli utility.]),
+[
+  if test "$enableval" != "no"; then
+    util_cli=1
+  else
+    util_cli=0
+  fi
+],
+[
+  util_cli=0
+])
+
 ### Ragel
 AC_ARG_WITH([ragel],
             [  --with-ragel=PROG ragel executable],
@@ -208,7 +223,6 @@ dnl TODO: These need to be optional (only if building apache httpd plugin)
 CHECK_APXS()
 CHECK_APR()
 CHECK_APU()
-dnl TODO: trafficserver plugin
 CHECK_TS()
 
 dnl Optional build modules
@@ -218,6 +232,11 @@ dnl
 TOPLEVEL_SUBDIRS="libs util engine plugins lua modules etc docs tests"
 LIBS_SUBDIRS=""
 PLUGINS_SUBDIRS="apache_httpd2 trafficserver"
+
+dnl Enable cli subdir if enabled
+if test "$util_cli" != 0; then
+    TOPLEVEL_SUBDIRS="${TOPLEVEL_SUBDIRS} cli"
+fi
 
 dnl Make sure abs_top_builddir is available
 AC_MSG_CHECKING([abs_top_builddir is available])
@@ -263,6 +282,10 @@ AC_CONFIG_FILES([engine/Makefile])
 AC_CONFIG_FILES([plugins/Makefile])
 AC_CONFIG_FILES([plugins/apache_httpd2/Makefile])
 AC_CONFIG_FILES([plugins/trafficserver/Makefile])
+
+if test "$util_cli" != 0; then
+AC_CONFIG_FILES([cli/Makefile])
+fi
 
 AC_CONFIG_FILES([lua/Makefile])
 AC_CONFIG_FILES([modules/Makefile])

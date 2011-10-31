@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *****************************************************************************/
+#define _POSIX_SOURCE 1
 
 /* These are required for getnameinfo */
 
@@ -144,7 +145,7 @@ static void process_data(TSCont contp, ibd_ctx* ibd)
   int64_t towrite;
   int64_t avail;
   int first_time = 0;
-  char *bufp;
+  char *bufp = NULL;
 
   TSDebug("ironbee", "Entering process_data()");
   /* Get the output (downstream) vconnection where we'll write data to. */
@@ -566,8 +567,7 @@ static int ironbee_plugin(TSCont contp, TSEvent event, void *edata)
   return 0;
 }
 
-static int
-check_ts_version(void)
+static int check_ts_version(void)
 {
 
   const char *ts_version = TSTrafficServerVersionGet();
@@ -616,7 +616,6 @@ static void ironbee_logger(void *dummy, int level,
     }
 
     /* Write it to the ironbee log. */
-    /* FIXME: why is the format arg's prototype not const char* ? */
     rc = prefix ? TSTextLogObjectWrite(ironbee_log, (char*)"%s: %s\n", prefix, buf)
                 : TSTextLogObjectWrite(ironbee_log, (char*)"%s\n", buf);
     if (rc != TS_SUCCESS) {
@@ -716,6 +715,7 @@ static int ironbee_init(const char *configfile, const char *logfile)
 //  ib_provider_t *lpr;
   ib_cfgparser_t *cp;
   ib_context_t *ctx;
+  int rv;
 
   rc = ib_initialize();
   if (rc != IB_OK) {
@@ -750,14 +750,14 @@ static int ironbee_init(const char *configfile, const char *logfile)
   /* success is documented as TS_LOG_ERROR_NO_ERROR but that's undefined.
    * It's actually a TS_SUCCESS (proxy/InkAPI.cc line 6641).
    */
-  rc = TSTextLogObjectCreate(logfile, TS_LOG_MODE_ADD_TIMESTAMP, &ironbee_log);
-  if (rc != TS_SUCCESS) {
-    return IB_OK + rc;
+  rv = TSTextLogObjectCreate(logfile, TS_LOG_MODE_ADD_TIMESTAMP, &ironbee_log);
+  if (rv != TS_SUCCESS) {
+    return IB_OK + rv;
   }
    
   rc = atexit(ibexit);
   if (rc != 0) {
-    return IB_OK + rc;
+    return IB_OK + rv;
   }
 
   ib_hook_register(ironbee, conn_opened_event,
@@ -792,9 +792,9 @@ TSPluginInit(int argc, const char *argv[])
   TSCont cont;
 
   /* FIXME - check why these are char*, not const char* */
-  info.plugin_name = (char*)"ironbee";
-  info.vendor_name = (char*)"Qualys, Inc";
-  info.support_email = (char*)"ironbee-users@lists.sourceforge.com";
+  info.plugin_name = (char *)"ironbee";
+  info.vendor_name = (char *)"Qualys, Inc";
+  info.support_email = (char *)"ironbee-users@lists.sourceforge.com";
 
   if (TSPluginRegister(TS_SDK_VERSION_3_0, &info) != TS_SUCCESS) {
     TSError("[ironbee] Plugin registration failed.\n");

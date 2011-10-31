@@ -52,6 +52,8 @@ extern "C" {
 
 /* Type definitions. */
 typedef struct ib_mpool_t ib_mpool_t;
+typedef struct ib_mpool_buffer_t ib_mpool_buffer_t;
+
 typedef struct ib_dso_t ib_dso_t;
 typedef void ib_dso_sym_t;
 typedef struct ib_hash_t ib_hash_t;
@@ -80,6 +82,7 @@ typedef enum ib_status_t {
     IB_EALLOC,                      /**< Could not allocate resources */
     IB_EINVAL,                      /**< Invalid argument */
     IB_ENOENT,                      /**< Entity does not exist */
+    IB_ETRUNC,                      /**< Buffer truncated, size limit reached */
     IB_ETIMEDOUT,                   /**< Operation timed out */
     IB_EAGAIN,                      /**< Not ready, try again later */
 } ib_status_t;
@@ -229,7 +232,26 @@ typedef ib_status_t (*ib_mpool_cleanup_fn_t)(void *);
  *
  * @returns Status code
  */
-ib_status_t DLL_PUBLIC ib_mpool_create(ib_mpool_t **pmp, ib_mpool_t *parent);
+ib_status_t DLL_PUBLIC ib_mpool_create(ib_mpool_t **pmp,
+                                       ib_mpool_t *parent);
+
+/**
+ * Create a new memory pool with predefined page size.
+ * Minimum size is IB_MPOOL_MIN_PAGE_SIZE (currently 512)
+ *
+ * @note If a pool has a parent specified, then any call to clear/destroy
+ * on the parent will propagate to all descendants.
+ *
+ * @param pmp Address which new pool is written
+ * @param parent Optional parent memory pool (or NULL)
+ * @param size Custom page size (to be used by default in pmp)
+ *
+ * @returns Status code
+ */
+ib_status_t DLL_PUBLIC ib_mpool_create_ex(ib_mpool_t **pmp,
+                               ib_mpool_t *parent,
+                               size_t size);
+
 
 /**
  * Allocate memory from a memory pool.
@@ -251,6 +273,16 @@ void DLL_PUBLIC *ib_mpool_alloc(ib_mpool_t *mp, size_t size);
  * @returns Address of allocated memory
  */
 void DLL_PUBLIC *ib_mpool_calloc(ib_mpool_t *mp, size_t nelem, size_t size);
+
+/**
+ * Duplicate a string.
+ *
+ * @param mp Memory pool
+ * @param src String to copy
+ *
+ * @returns Address of the duplicated string
+ */
+char DLL_PUBLIC *ib_mpool_strdup(ib_mpool_t *mp, const char *src);
 
 /**
  * Duplicate a memory block.
@@ -325,6 +357,24 @@ typedef struct ib_list_node_t ib_list_node_t;
     size_t nelts; /**< Number of elements in list */ \
     ntype *head; /**< First node in list */ \
     ntype *tail /**< Last node in list */
+
+/**
+ * @internal
+ * List node structure.
+ */
+struct ib_list_node_t {
+    IB_LIST_NODE_REQ_FIELDS(ib_list_node_t);  /* Required fields */
+    void              *data;                  /**< Node data */
+};
+
+/**
+ * @internal
+ * List structure.
+ */
+struct ib_list_t {
+    ib_mpool_t       *mp;
+    IB_LIST_REQ_FIELDS(ib_list_node_t);       /* Required fields */
+};
 
 /**
  * First node of a list.
@@ -589,6 +639,36 @@ ib_status_t DLL_PUBLIC ib_list_push(ib_list_t *list, void *data);
 ib_status_t DLL_PUBLIC ib_list_pop(ib_list_t *list, void *pdata);
 
 /**
+ * Insert data at the first position of the list (queue behavior)
+ *
+ * This is currently just an alias for @ref ib_list_unshift().
+ *
+ * @param list List
+ * @param data Address which data is stored (if non-NULL)
+ *
+ * @returns Status code
+ */
+ib_status_t DLL_PUBLIC ib_list_enqueue(ib_list_t *list, void *data);
+
+#define ib_list_enqueue(list, data) \
+    ib_list_unshift((list), (data))
+
+/**
+ * Fetch and remove data at the end of the list (queue behavior)
+ *
+ * This is currently just an alias for @ref ib_list_pop().
+ *
+ * @param list List
+ * @param pdata Address which data is stored (if non-NULL)
+ *
+ * @returns Status code
+ */
+ib_status_t DLL_PUBLIC ib_list_dequeue(ib_list_t *list, void *pdata);
+
+#define ib_list_dequeue(list, data) \
+    ib_list_pop((list), (data))
+
+/**
  * Insert data at the beginning of a list.
  *
  * @param list List
@@ -799,6 +879,31 @@ size_t DLL_PUBLIC ib_array_size(ib_array_t *arr);
          ib_array_get((arr),(idx),(void *)&(val))==IB_OK && (idx)<(ne); \
          (idx)++)
 
+/**
+ * Dynamic array loop in reverse.
+ *
+ * This just loops over the indexes in a dynamic array in reverse order.
+ *
+ * @code
+ * // Where data stored in "arr" is "int *", this will print all int values.
+ * size_t ne;
+ * size_t idx;
+ * int *val;
+ * IB_ARRAY_LOOP_REVERSE(arr, ne, idx, val) {
+ *     printf("%4d: item[%p]=%d\n", i++, val, *val);
+ * }
+ * @endcode
+ *
+ * @param arr Array
+ * @param ne Symbol holding the number of elements
+ * @param idx Symbol holding the index, set for each iteration
+ * @param val Symbol holding the value at the index, set for each iteration
+ */
+#define IB_ARRAY_LOOP_REVERSE(arr,ne,idx,val) \
+    for ((ne)=ib_array_elements(arr), (idx)=(ne)>0?(ne)-1:0; \
+         ib_array_get((arr),(idx),(void *)&(val))==IB_OK && (idx)>0; \
+         (idx)--)
+
 /** @} IronBeeUtilArray */
 
 
@@ -808,8 +913,21 @@ size_t DLL_PUBLIC ib_array_size(ib_array_t *arr);
  * @{
  */
 
+typedef unsigned int (*ib_hashfunc_t)(const void *key, size_t len,
+                                      uint8_t flags);
+
+#define IB_HASH_INITIAL_SIZE   15
+
+/* Options */
+#define IB_HASH_FLAG_NOCASE    0x01 /**< Ignore case lookup */
+
+typedef struct ib_hash_entry_t ib_hash_entry_t;
+typedef struct ib_hash_iter_t ib_hash_iter_t;
+
 /**
- * Create a hash table.
+ * Create a hash table with nocase option by default.
+ *
+ * If you do not need key case insensitivity, use @ref ib_hash_create_ex()
  *
  * @param ph Address which new hash table is written
  * @param pool Memory pool to use
@@ -817,6 +935,59 @@ size_t DLL_PUBLIC ib_array_size(ib_array_t *arr);
  * @returns Status code
  */
 ib_status_t DLL_PUBLIC ib_hash_create(ib_hash_t **ph, ib_mpool_t *pool);
+
+#define ib_hash_create(ph,pool) \
+    ib_hash_create_ex(ph, pool, IB_HASH_INITIAL_SIZE, IB_HASH_FLAG_NOCASE)
+
+/**
+ * DJB2 Hash Function (Dan Bernstein).
+ *
+ * This is the default hash function.
+ *
+ * @param key buffer holding the key to hash
+ * @param len size of the key to hash in bytes
+ * @param flags bit flag options for the key
+ *              (currently IB_HASH_FLAG_NOCASE)
+ *
+ * @returns Status code
+ */
+unsigned int DLL_PUBLIC ib_hashfunc_djb2(const void *char_key,
+                                         size_t len,
+                                         uint8_t flags);
+
+/**
+ * Create a hash table with nocase option by default.
+ * If you dont need it, use ib_hash_create_ex
+ *
+ * @param ph Address which new hash table is written
+ * @param pool Memory pool to use
+ *
+ * @returns Status code
+ */
+ib_status_t DLL_PUBLIC ib_hash_create_ex(ib_hash_t **ht,
+                                         ib_mpool_t *pool,
+                                         int slots,
+                                         uint8_t flags);
+
+/**
+ * @internal
+ * Seach an entry for the given key and key length
+ * The hash used to search the key will be also returned via param
+ *
+ * @param ib_ht the hash table to search in
+ * @param key buffer holding the key
+ * @param len number of bytes key length
+ * @param hte pointer reference used to store the entry if found
+ * @param hash reference to store the calculated hash
+ *
+ * @returns Status code
+ */
+ib_status_t DLL_PUBLIC ib_hash_find_entry(ib_hash_t *ib_ht,
+                                          const void *key,
+                                          size_t len,
+                                          ib_hash_entry_t **hte,
+                                          unsigned int *hash,
+                                          uint8_t lookup_flags);
 
 /**
  * Clear a hash table.
@@ -830,17 +1001,18 @@ void DLL_PUBLIC ib_hash_clear(ib_hash_t *h);
  *
  * @param h Hash table
  * @param key Key to lookup
- * @param klen Length of key
+ * @param len Length of key
  * @param pdata Address which data is written
  *
  * @returns Status code
  */
 ib_status_t DLL_PUBLIC ib_hash_get_ex(ib_hash_t *h,
-                                      void *key, size_t klen,
-                                      void *pdata);
+                                      void *key, size_t len,
+                                      void *pdata,
+                                      uint8_t lookup_flags);
 
 /**
- * Get data from a hash table via key (string).
+ * Get data from a hash table via NUL terminated key.
  *
  * @param h Hash table
  * @param key Key to lookup
@@ -849,6 +1021,20 @@ ib_status_t DLL_PUBLIC ib_hash_get_ex(ib_hash_t *h,
  * @returns Status code
  */
 ib_status_t DLL_PUBLIC ib_hash_get(ib_hash_t *h,
+                                   const char *key,
+                                   void *pdata);
+
+/**
+ * Get data from a hash table via NUL terminated key with ignore
+ * case option set.
+ *
+ * @param h Hash table
+ * @param key Key to lookup
+ * @param pdata Address which data is written
+ *
+ * @returns Status code
+ */
+ib_status_t DLL_PUBLIC ib_hash_get_nocase(ib_hash_t *h,
                                    const char *key,
                                    void *pdata);
 
@@ -867,14 +1053,15 @@ ib_status_t DLL_PUBLIC ib_hash_get_all(ib_hash_t *h, ib_list_t *list);
  *
  * @param h Hash table
  * @param key Key to lookup
- * @param klen Length of key
+ * @param len Length of key
  * @param data Data
  *
  * @returns Status code
  */
 ib_status_t DLL_PUBLIC ib_hash_set_ex(ib_hash_t *h,
-                                      void *key, size_t klen,
-                                      void *data);
+                                      const void *key,
+                                      size_t len,
+                                      const void *data);
 
 /**
  * Set data in a hash table via key (string).
@@ -894,13 +1081,14 @@ ib_status_t DLL_PUBLIC ib_hash_set(ib_hash_t *h,
  *
  * @param h Hash table
  * @param key Key to lookup
- * @param klen Length of key
+ * @param len Length of key
  * @param pdata Address which data is written (or NULL if not required)
  *
  * @returns Status code
  */
 ib_status_t DLL_PUBLIC ib_hash_remove_ex(ib_hash_t *h,
-                                         void *key, size_t klen,
+                                         void *key,
+                                         size_t len,
                                          void *pdata);
 
 /**
@@ -915,6 +1103,30 @@ ib_status_t DLL_PUBLIC ib_hash_remove_ex(ib_hash_t *h,
 ib_status_t DLL_PUBLIC ib_hash_remove(ib_hash_t *h,
                                       const char *key,
                                       void *pdata);
+
+#define ib_hash_remove(h,key,pdata) \
+    ib_hash_remove_ex((h),(void *)(key),strlen(key),(pdata))
+
+
+/**
+ * Creates an initialized iterator for the hash table entries.
+ *
+ * @param mp Memory pool for the iterator allocation
+ * @param ib_ht hash table to iterate
+ *
+ * @returns Status code
+ */
+ib_hash_iter_t DLL_PUBLIC *ib_hash_first(ib_mpool_t *p,
+                                         ib_hash_t *ib_ht);
+
+/**
+ * Move the iterator to the next entry.
+ *
+ * @param hti hash table iterator
+ *
+ * @returns Status code
+ */
+ib_hash_iter_t DLL_PUBLIC *ib_hash_next(ib_hash_iter_t *hti);
 
 /** @} IronBeeUtilHash */
 
@@ -2063,6 +2275,318 @@ ib_status_t ib_radix_ip_to_prefix(const char *cidr,
                                   ib_mpool_t *mp);
 
 /** @} IronBeeUtilRadix */
+
+/**
+ * @defgroup IronBeeUtilAhoCorasick
+ * @{
+ */
+
+/* General flags for the parser (and matcher) */
+#define IB_AC_FLAG_PARSER_NOCASE    0x01 /**< Case insensitive */
+#define IB_AC_FLAG_PARSER_COMPILED  0x02 /**< "Compiled", failure state 
+                                              links and output state links 
+                                              are built */
+#define IB_AC_FLAG_PARSER_READY     0x04 /**< the ac automata is ready */
+
+/* Node specific flags */
+#define IB_AC_FLAG_STATE_OUTPUT     0x01 /**< This flag indicates that
+                                              the current state produce
+                                              an output */
+
+/* Flags for the consume() function (matching function) */
+#define IB_AC_FLAG_CONSUME_DEFAULT       0x00 /**< No match list, no
+                                                   callback, returns on
+                                                   the first match
+                                                   (if any) */
+
+#define IB_AC_FLAG_CONSUME_MATCHALL      0x01 /**< Should be used in
+                                                   combination to dolist 
+                                                   or docallback. Otherwise
+                                                   you are wasting cycles*/
+
+#define IB_AC_FLAG_CONSUME_DOLIST        0x02 /**< Enable the storage of a
+                                                   list of matching states 
+                                                   (match_list located at 
+                                                   the matching context */
+
+#define IB_AC_FLAG_CONSUME_DOCALLBACK    0x04 /**< Enable the callback
+                                                   (you must also register
+                                                   the pattern with the
+                                                   callback) */
+
+
+typedef struct ib_ac_t ib_ac_t;
+typedef struct ib_ac_state_t ib_ac_state_t;
+typedef struct ib_ac_context_t ib_ac_context_t;
+typedef struct ib_ac_match_t ib_ac_match_t;
+
+typedef char ib_ac_char_t;
+
+/**
+ * Aho Corasick tree. Used to parse and store the states and transitions
+ */
+struct ib_ac_t {
+    uint8_t flags;          /**< flags of the matcher and parser */
+    ib_mpool_t *mp;         /**< mem pool */
+
+    ib_ac_state_t *root;     /**< root of the direct tree */
+
+    uint32_t pattern_cnt;   /**< number of patterns */
+};
+
+/**
+ * Aho Corasick matching context. Used to consume a buffer in chunks
+ * It also store a list of matching states
+ */
+struct ib_ac_context_t {
+    ib_ac_t *ac_tree;           /**< Aho Corasick automata */
+    ib_ac_state_t *current;     /**< Current state of match */
+
+    size_t processed;           /**> number of bytes processed over
+                                     multiple consume calls */
+    size_t current_offset;      /**> number of bytes processed in
+                                     the last (or current) call */
+
+    ib_list_t *match_list;      /**< result list of matches */
+    size_t match_cnt;           /**< number of matches */
+}; 
+
+/**
+ * Aho Corasick match result. Holds the pattern, pattern length
+ * offset from the beggining of the match, and relative offset.
+ * Relative offset is the offset from the end of the given chunk buffer
+ * Keep in mind that the start of the match can be at a previous
+ * processed chunk
+ */
+struct ib_ac_match_t {
+    const ib_ac_char_t *pattern;     /**< pointer to the original pattern */
+    const void *data;                /**< pointer to the data associated */
+    size_t pattern_len;              /**< pattern length */
+
+    size_t offset;                   /**< offset over all the segments processed
+                                          by this context to the start of
+                                          the match */
+
+    size_t relative_offset;          /**< offset of the match from the last
+                                          processed buffer within the current
+                                          context. Keep in mind that this value
+                                          can be negative if a match started
+                                          from a previous buffer! */
+};
+
+/* Callback definition for functions processing matches */
+typedef void (*ib_ac_callback_t)(ib_ac_t *orig,
+                                 ib_ac_char_t *pattern,
+                                 size_t pattern_len,
+                                 void *userdata,
+                                 size_t offset,
+                                 size_t relative_offset);
+
+
+
+/**
+ * Init macro for a matching context (needed by ib_ac_consume())
+ * @param ac_ctx the ac matching context
+ * @param ac_tree the ac tree
+ */
+#define ib_ac_init_ctx(ac_ctx,ac_t) \
+        do { \
+            (ac_ctx)->ac_tree = (ac_t); \
+            if ((ac_t) != NULL) {\
+            (ac_ctx)->current = (ac_t)->root; }\
+            (ac_ctx)->processed = 0; \
+            (ac_ctx)->current_offset = 0; \
+            (ac_ctx)->match_cnt = 0; \
+            (ac_ctx)->match_list = NULL; \
+        } while(0)
+
+/**
+ * Reset macro for a matching context
+ * @param ac_ctx the ac matching context
+ * @param ac_tree the ac tree
+ */
+#define ib_ac_reset_ctx(ac_ctx,ac_t) \
+        do { \
+            (ac_ctx)->ac_tree = (ac_t); \
+            if ((ac_t) != NULL) {\
+            (ac_ctx)->current = (ac_t)->root; }\
+            (ac_ctx)->processed = 0; \
+            (ac_ctx)->match_cnt = 0; \
+            (ac_ctx)->current_offset = 0; \
+            if ((ac_ctx)->match_list != NULL) \
+                ib_list_clear((ac_ctx)->match_list); \
+        } while(0)
+
+
+
+/**
+ * creates an aho corasick automata with states in trie form
+ *
+ * @param ac_tree pointer to store the matcher
+ * @param flags options for the matcher
+ * @param pool memory pool to use
+ *
+ * @returns Status code
+ */
+ib_status_t ib_ac_create(ib_ac_t **ac_tree,
+                         uint8_t flags,
+                         ib_mpool_t *pool);
+
+/**
+ * builds links between states (the AC failure function)
+ *
+ * @param ac_tree pointer to store the matcher
+ *
+ * @returns Status code
+ */
+ib_status_t ib_ac_build_links(ib_ac_t *ac_tree);
+
+/**
+ * adds a pattern into the trie
+ *
+ * @param ac_tree pointer to the matcher
+ * @param pattern to add
+ * @param callback function pointer to call if pattern is found
+ * @param data pointer to pass to the callback if pattern is found
+ * @param len the length of the pattern
+ *
+ * @returns Status code
+ */
+ib_status_t ib_ac_add_pattern(ib_ac_t *ac_tree,
+                              const char *pattern,
+                              ib_ac_callback_t callback,
+                              void *data,
+                              size_t len);
+
+/**
+ * Search patterns of the ac_tree matcher in the given buffer using a 
+ * matching context. The matching context stores offsets used to process
+ * a search over multiple data segments. The function has option flags to
+ * specify to return where the first pattern is found, or after all the
+ * data is consumed, using a user specified callback and/or building a
+ * list of patterns matched
+ *
+ * @param ac_ctx pointer to the matching context
+ * @param data pointer to the buffer to search in
+ * @param len the length of the data
+ * @param flags options to use while matching
+ * @param mp memory pool to use
+ *
+ * @returns Status code */
+
+ib_status_t ib_ac_consume(ib_ac_context_t *ac_ctx,
+                          const char *data,
+                          size_t len,
+                          uint8_t flags,
+                          ib_mpool_t *mp);
+
+
+/** @} IronBeeUtilAhoCorasick */
+
+/**
+ * @defgroup IronBeeUtilUUID
+ * @{
+ */
+
+/**
+ * @internal
+ * Universal Unique ID Structure.
+ *
+ * This is a modified UUIDv1 (RFC-4122) that uses fields as follows:
+ *
+ * time_low: 32-bit second accuracy time that tx started
+ * time_mid: 16-bit counter
+ * time_hi_and_ver: 4-bit version (0100) + 12-bit least sig usec
+ * clk_seq_hi_res: 2-bit reserved (10) + 6-bit reserved (111111)
+ * clk_seq_low: 8-bit reserved (11111111)
+ * node(0-1): 16-bit process ID
+ * node(2-5): 32-bit ID (system default IPv4 address by default)
+ *
+ * This is loosely based of of Apache mod_unique_id, but with
+ * future expansion in mind.
+ */
+typedef struct ib_uuid_t ib_uuid_t;
+struct ib_uuid_t {
+    uint32_t  time_low;
+    uint16_t  time_mid;
+    uint16_t  time_hi_and_ver;
+    uint8_t   clk_seq_hi_res;
+    uint8_t   clk_seq_low;
+    uint8_t   node[6];
+};
+
+/**
+ * Parses an ASCII UUID (with the format xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+ * where x are hexa chars) into a ib_uuid_t
+ *
+ * @param ibuuid pointer to an already allocated ib_uuid_t buffer
+ * @param uuid pointer to the ascii string of the uuid (no blank spaces allowed)
+ * @param ib pointer to the engine (to log format errors)
+ *
+ * @returns Status code
+ */
+ib_status_t ib_uuid_ascii_to_bin(ib_uuid_t *ibuuid,
+                                const char *uuid);
+/** @} IronBeeUtilUUID */
+
+/**
+ * @defgroup IronBeeUtilLogformat
+ * @{
+ */
+#define IB_LOGFORMAT_MAXFIELDS 128
+#define IB_LOGFORMAT_MAXLINELEN 8192
+#define IB_LOGFORMAT_DEFAULT ((char*)"%T %h %a %S %s %t %f")
+
+typedef struct ib_logformat_t ib_logformat_t;
+
+/* fields */
+#define IB_LOG_FIELD_REMOTE_ADDR        'a'
+#define IB_LOG_FIELD_LOCAL_ADDR         'A'
+#define IB_LOG_FIELD_HOSTNAME           'h'
+#define IB_LOG_FIELD_SITE_ID            's'
+#define IB_LOG_FIELD_SENSOR_ID          'S'
+#define IB_LOG_FIELD_TRANSACTION_ID     't'
+#define IB_LOG_FIELD_TIMESTAMP          'T'
+#define IB_LOG_FIELD_LOG_FILE           'f'
+
+struct ib_logformat_t {
+    ib_mpool_t *mp;
+    char *orig_format;
+    uint8_t literal_starts;
+
+    /* We could use here an ib_list, but this will is faster */
+    char fields[IB_LOGFORMAT_MAXFIELDS];     /**< Used to hold the field list */
+    char *literals[IB_LOGFORMAT_MAXFIELDS + 2]; /**< Used to hold the list of
+                                                   literal strings at the start,
+                                                 end, and between fields */
+    int literals_len[IB_LOGFORMAT_MAXFIELDS + 2]; /**< Used to hold the sizes of
+                                                       literal strings */
+    uint8_t field_cnt;   /**< Fields count */
+    uint8_t literal_cnt; /**< Literals count */
+};
+
+/**
+ * Creates a logformat helper
+ *
+ * @param mp memory pool to use
+ * @param lf reference pointer where the new instance will be stored
+ *
+ * @returns Status code
+ */
+ib_status_t ib_logformat_create(ib_mpool_t *mp, ib_logformat_t **lf);
+
+/**
+ * Used to parse and store the specified format
+ *
+ * @param mp memory pool to use
+ * @param lf pointer to the logformat helper
+ * @param format string with the format to process
+ *
+ * @returns Status code
+ */
+ib_status_t ib_logformat_set(ib_logformat_t *lf, char *format);
+/** @} IronBeeUtilLogformat */
+
 
 /**
  * @} IronBeeUtil

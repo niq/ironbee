@@ -44,32 +44,61 @@ extern "C" {
  * @{
  */
 
-/** Module structure symbol name. */
-#define IB_MODULE_SYM                 ibmodule
+/** Module symbol name. */
+#define IB_MODULE_SYM                 ironbee_module
+
+/** Module symbol name as a string. */
 #define IB_MODULE_SYM_NAME            IB_XSTRINGIFY(IB_MODULE_SYM)
 
-/** Module declaration. */
+/** Module structure. */
+#define IB_MODULE_STRUCT              ibsym__module
+
+/** Address of module structure. */
+#define IB_MODULE_STRUCT_PTR          &IB_MODULE_STRUCT
+
+/**
+ * Module declaration.
+ *
+ * This macro needs to be called towards the beginning of a module if
+ * the module needs to refer to @ref IB_MODULE_STRUCT or
+ * @ref IB_MODULE_STRUCT_PTR before the module structure is initialized
+ * with @ref IB_MODULE_INIT.
+ */
+#ifdef __cplusplus
+/* C++ cannot do forward declarations for IB_MODULE_STRUCT. */
 #define IB_MODULE_DECLARE() \
-    ib_module_t DLL_PUBLIC IB_MODULE_SYM
+    ib_module_t DLL_PUBLIC *IB_MODULE_SYM(void); \
+    extern ib_module_t IB_MODULE_STRUCT
+#else
+#define IB_MODULE_DECLARE() \
+    ib_module_t DLL_PUBLIC *IB_MODULE_SYM(void); \
+    static ib_module_t IB_MODULE_STRUCT
+#endif
 
-/** Module symbol initialization. */
+/**
+ * Module structure initialization.
+ *
+ * This is typically the last macro called in a module. It initializes
+ * the module structure (@ref IB_MODULE_STRUCT), which allows a module
+ * to be registered with the engine. The macro takes a list of all
+ * @ref ib_module_t field values.
+ */
+#ifdef __cplusplus
+/* C++ cannot do forward declarations for IB_MODULE_STRUCT. */
 #define IB_MODULE_INIT(...) \
-    ib_module_t IB_MODULE_SYM = { \
-        __VA_ARGS__ \
-    }
-
-/** Data associated with the module */
-#define IB_MODULE_DATA \
-    IB_MODULE_SYM.data
-
-/** Module initialization. */
-/// @todo Need a batter way
-#define IB_MODULE_INIT_STATIC(name, ...) \
-    ib_module_t real_##name = { \
+    ib_module_t IB_MODULE_STRUCT = { \
         __VA_ARGS__ \
     }; \
-    ib_module_t *name(void) { return &real_##name; } \
-    typedef int ib_require_semicolon_hack_##name
+    ib_module_t *IB_MODULE_SYM(void) { return IB_MODULE_STRUCT_PTR; } \
+    typedef int ib_require_semicolon_hack_
+#else
+#define IB_MODULE_INIT(...) \
+    static ib_module_t IB_MODULE_STRUCT = { \
+        __VA_ARGS__ \
+    }; \
+    ib_module_t *IB_MODULE_SYM(void) { return IB_MODULE_STRUCT_PTR; } \
+    typedef int ib_require_semicolon_hack_
+#endif
 
 /**
  * Initialize values for dynamic modules created with ib_module_create().
@@ -86,8 +115,9 @@ extern "C" {
  * @param xfn_init Initialize function
  * @param xfn_fini Finish function
  * @param xfn_ctx_init Context init function
+ * @param xfn_ctx_fini Context fini function
  */
-#define IB_MODULE_INIT_DYNAMIC(m,xfilename,xdata,xib,xname,xgcdata,xgclen,xcm_init,xdm_init,xfn_init,xfn_fini,xfn_ctx_init) \
+#define IB_MODULE_INIT_DYNAMIC(m,xfilename,xdata,xib,xname,xgcdata,xgclen,xcm_init,xdm_init,xfn_init,xfn_fini,xfn_ctx_init,xfn_ctx_fini) \
     do { \
         (m)->vernum = IB_VERNUM; \
         (m)->abinum = IB_ABINUM; \
@@ -104,6 +134,7 @@ extern "C" {
         (m)->fn_init = xfn_init; \
         (m)->fn_fini = xfn_fini; \
         (m)->fn_ctx_init = xfn_ctx_init; \
+        (m)->fn_ctx_fini = xfn_ctx_fini; \
     } while (0)
 
 /** Defaults for all module structure headers */
@@ -116,8 +147,23 @@ extern "C" {
                                       0
 
 /** Module config structure and size */
-#define IB_MODULE_CONFIG(ptr)         (ptr), \
-                                      ((ptr!=NULL)?sizeof(*(ptr)):0)
+#define IB_MODULE_CONFIG(ptr)         (ptr), (sizeof(*(ptr)))
+
+/** Used to signify that there is no config structure for the module. */
+#define IB_MODULE_CONFIG_NULL         NULL, 0
+
+/**
+ * Function which is exported in an IronBee module to return the address
+ * to the module structure used to load the module.
+ *
+ * This module function is declared by @ref IB_MODULE_DECLARE and defined
+ * by @ref IB_MODULE_INIT. The address of this function is looked up by
+ * name (@ref IB_MODULE_SYM) when the module is loaded and called to fetch
+ * the address of the module structure built with @ref IB_MODULE_INIT.
+ *
+ * @returns Address of the module structure
+ */
+typedef ib_module_t *(*ib_module_sym_fn)(void);
 
 /**
  * Function to initialize a module.
@@ -159,6 +205,22 @@ typedef ib_status_t (*ib_module_fn_ctx_init_t)(ib_engine_t *ib,
                                                ib_module_t *m,
                                                ib_context_t *ctx);
 
+/**
+ * Function to finish a module configuration context.
+ *
+ * This is called when @ref ib_context_destroy() is called to finish
+ * a configuration context. This should be used to destroy
+ * any per-config-context resources.
+ *
+ * @param ib Engine handle
+ * @param ctx Config context
+ *
+ * @returns Status code
+ */
+typedef ib_status_t (*ib_module_fn_ctx_fini_t)(ib_engine_t *ib,
+                                               ib_module_t *m,
+                                               ib_context_t *ctx);
+
 struct ib_module_t {
     /* Header */
     uint32_t                vernum;           /**< Engine version number */
@@ -172,7 +234,7 @@ struct ib_module_t {
 
     /* Module Config */
     const char             *name;             /**< Module name */
-    const void             *gcdata;           /**< Global config data */
+    void                   *gcdata;           /**< Global config data */
     size_t                  gclen;            /**< Global config data length */
     const ib_cfgmap_init_t *cm_init;          /**< Module config mapping */
     const ib_dirmap_init_t *dm_init;          /**< Module directive mapping */
@@ -181,6 +243,7 @@ struct ib_module_t {
     ib_module_fn_init_t     fn_init;          /**< Module init */
     ib_module_fn_fini_t     fn_fini;          /**< Module finish */
     ib_module_fn_ctx_init_t fn_ctx_init;      /**< Module context init */
+    ib_module_fn_ctx_fini_t fn_ctx_fini;      /**< Module context finish */
 };
 
 #define CORE_MODULE_NAME         core
@@ -202,22 +265,25 @@ struct ib_core_cfg_t {
         ib_provider_inst_t *parser;  /**< Parser provider instance */
     } pi;
 
-    ib_num_t      log_level;         /**< Log level */
-    char         *log_uri;           /**< Log URI */
-    char         *logger;            /**< Active logger provider key */
-    char         *logevent;          /**< Active logevent provider key */
-    ib_num_t      buffer_req;        /**< Request buffering options */
-    ib_num_t      buffer_res;        /**< Response buffering options */
-    ib_num_t      audit_engine;      /**< Audit engine status */
-    ib_num_t      auditlog_dmode;    /**< Audit log dir create mode */
-    ib_num_t      auditlog_fmode;    /**< Audit log file create mode */
-    ib_num_t      auditlog_parts;    /**< Audit log parts */
-    char         *auditlog_index;    /**< Audit log index filename */
-    char         *auditlog_dir;      /**< Audit log base directory */
-    char         *auditlog_sdir_fmt; /**< Audit log sub-directory format */
-    char         *audit;             /**< Active audit provider key */
-    char         *parser;            /**< Active parser provider key */
-    char         *data;              /**< Active data provider key */
+    ib_num_t         log_level;         /**< Log level */
+    char            *log_uri;           /**< Log URI */
+    char            *logger;            /**< Active logger provider key */
+    char            *logevent;          /**< Active logevent provider key */
+    ib_num_t         buffer_req;        /**< Request buffering options */
+    ib_num_t         buffer_res;        /**< Response buffering options */
+    ib_num_t         audit_engine;      /**< Audit engine status */
+    ib_num_t         auditlog_dmode;    /**< Audit log dir create mode */
+    ib_num_t         auditlog_fmode;    /**< Audit log file create mode */
+    ib_num_t         auditlog_parts;    /**< Audit log parts */
+    FILE            *auditlog_index_fp; /**< Audit log index file pointer */
+    char            *auditlog_index;    /**< Audit log index filename */
+    char            *auditlog_index_fmt;/**< Audit log index format string */
+    ib_logformat_t  *auditlog_index_hp; /**< Audit log index format helper */
+    char            *auditlog_dir;      /**< Audit log base directory */
+    char            *auditlog_sdir_fmt; /**< Audit log sub-directory format */
+    char            *audit;             /**< Active audit provider key */
+    char            *parser;            /**< Active parser provider key */
+    char            *data;              /**< Active data provider key */
 };
 
 /**

@@ -147,7 +147,7 @@ static ib_status_t pocsig_dir_signature(ib_cfgparser_t *cp,
     ib_status_t rc;
 
     /* Get the pocsig configuration for this context. */
-    rc = ib_context_module_config(ctx, &IB_MODULE_SYM, (void *)&cfg);
+    rc = ib_context_module_config(ctx, IB_MODULE_STRUCT_PTR, (void *)&cfg);
     if (rc != IB_OK) {
         ib_log_error(ib, 1, "Failed to fetch %s config: %d",
                      MODULE_NAME_STR, rc);
@@ -260,12 +260,9 @@ static ib_status_t pocsig_dir_signature(ib_cfgparser_t *cp,
         IB_FTRACE_RET_STATUS(IB_EALLOC);
     }
 
-    sig->target = ib_mpool_memdup(ib_engine_pool_config_get(ib),
-                                  target, strlen(target));
-    sig->patt = ib_mpool_memdup(ib_engine_pool_config_get(ib),
-                                 op, strlen(op));
-    sig->emsg = ib_mpool_memdup(ib_engine_pool_config_get(ib),
-                                action, strlen(action));
+    sig->target = ib_mpool_strdup(ib_engine_pool_config_get(ib), target);
+    sig->patt = ib_mpool_strdup(ib_engine_pool_config_get(ib), op);
+    sig->emsg = ib_mpool_strdup(ib_engine_pool_config_get(ib), action);
 
     /* Compile the PCRE patt. */
     if (cfg->pcre == NULL) {
@@ -381,7 +378,7 @@ static ib_status_t pocsig_handle_sigs(ib_engine_t *ib,
     ib_status_t rc;
 
     /* Get the pocsig configuration for this context. */
-    rc = ib_context_module_config(tx->ctx, &IB_MODULE_SYM, (void *)&cfg);
+    rc = ib_context_module_config(tx->ctx, IB_MODULE_STRUCT_PTR, (void *)&cfg);
     if (rc != IB_OK) {
         ib_log_error(ib, 1, "Failed to fetch %s config: %d",
                      MODULE_NAME_STR, rc);
@@ -416,7 +413,7 @@ static ib_status_t pocsig_handle_sigs(ib_engine_t *ib,
         /* Perform the match. */
         ib_log_debug(ib, dbglvl, "PocSig: Matching \"%s\" against field \"%s\"",
                      s->patt, s->target);
-        rc = ib_matcher_match_field(cfg->pcre, s->cpatt, 0, f);
+        rc = ib_matcher_match_field(cfg->pcre, s->cpatt, 0, f, NULL);
         if (rc == IB_OK) {
             ib_logevent_t *e;
 
@@ -524,5 +521,6 @@ IB_MODULE_INIT(
     pocsig_init,                         /**< Initialize function */
     NULL,                                /**< Finish function */
     pocsig_context_init,                 /**< Context init function */
+    NULL                                 /**< Context fini function */
 );
 

@@ -34,8 +34,6 @@
 #include <arpa/inet.h> /* htonl */
 #include <unistd.h>
 
-
-
 #include <ironbee/engine.h>
 #include <ironbee/util.h>
 #include <ironbee/module.h>
@@ -97,7 +95,10 @@ static ib_status_t _ib_context_get(ib_engine_t *ib,
 
         rc = ctx->fn_ctx(ctx, type, data, ctx->fn_ctx_data);
         if (rc == IB_OK) {
-            ib_log_debug(ib, 9, "Selected context %d=%p", (int)i, ctx);
+            ib_site_t *site = ib_context_site_get(ctx);
+            ib_log_debug(ib, 7, "Selected context %d=%p site=%s(%s)",
+                    (int)i, ctx,
+                    (site?site->id_str:"none"), (site?site->name:"none"));
             *pctx = ctx;
             break;
         }
@@ -160,7 +161,7 @@ ib_status_t ib_engine_create(ib_engine_t **pib, void *plugin)
     /* Create an engine config context and use it as the
      * main context until the engine can be configured.
      */
-    rc = ib_context_create(&((*pib)->ectx), *pib, NULL, NULL, NULL);
+    rc = ib_context_create(&((*pib)->ectx), *pib, NULL, NULL, NULL, NULL);
     if (rc != IB_OK) {
         goto failed;
     }
@@ -185,7 +186,7 @@ ib_status_t ib_engine_create(ib_engine_t **pib, void *plugin)
 
     /* Sensor info. */
     /// @todo Fetch real values
-    (*pib)->sensor_id = 0;
+    memset(&(*pib)->sensor_id, 0, sizeof(ib_uuid_t));
     (*pib)->sensor_name = IB_DSTR_UNKNOWN;
     (*pib)->sensor_version = IB_PRODUCT_VERSION_NAME;
     (*pib)->sensor_hostname = IB_DSTR_UNKNOWN;
@@ -261,7 +262,7 @@ static ib_status_t ib_engine_context_create_main(ib_engine_t *ib)
     ib_context_t *ctx;
     ib_status_t rc;
     
-    rc = ib_context_create(&ctx, ib, ib->ectx, NULL, NULL);
+    rc = ib_context_create(&ctx, ib, ib->ectx, NULL, NULL, NULL);
     if (rc != IB_OK) {
         IB_FTRACE_RET_STATUS(rc);
     }
@@ -324,6 +325,36 @@ void ib_engine_destroy(ib_engine_t *ib)
 {
     IB_FTRACE_INIT(ib_destroy);
     if (ib) {
+        size_t ne;
+        size_t idx;
+        ib_context_t *ctx;
+        ib_module_t *cm = ib_core_module();
+        ib_module_t *m;
+
+        /// @todo Destroy filters
+
+        ib_log(ib, 9, "Destroying configuration contexts...");
+        IB_ARRAY_LOOP_REVERSE(ib->contexts, ne, idx, ctx) {
+            if (   (ctx != ib->ctx)
+                && (ctx != ib->ectx) )
+            {
+                ib_context_destroy(ctx);
+            }
+        }
+        if (ib->ctx != ib->ectx) {
+            ib_log(ib, 9, "Destroying main configuration context...");
+            ib_context_destroy(ib->ctx);
+        }
+        ib_log(ib, 9, "Destroying engine configuration context...");
+        ib_context_destroy(ib->ectx);
+
+        ib_log(ib, 9, "Unloading modules...");
+        IB_ARRAY_LOOP_REVERSE(ib->modules, ne, idx, m) {
+            if (m != cm) {
+                ib_module_unload(m);
+            }
+        }
+
         ib_log(ib, 9, "Destroy IB handle (%d,%d,%s,%s): %p",
                ib->plugin->vernum, ib->plugin->abinum,
                ib->plugin->filename, ib->plugin->name, ib);
@@ -371,10 +402,10 @@ ib_status_t ib_conn_create(ib_engine_t *ib,
      */
     (*pconn)->base_uuid.node[0] = (pid16 >> 8) & 0xff;
     (*pconn)->base_uuid.node[1] = (pid16 & 0xff);
-    (*pconn)->base_uuid.node[2] = ib->sensor_id & 0xff;
-    (*pconn)->base_uuid.node[3] = (ib->sensor_id >> 8) & 0xff;
-    (*pconn)->base_uuid.node[4] = (ib->sensor_id >> 16) & 0xff;
-    (*pconn)->base_uuid.node[5] = (ib->sensor_id >> 24) & 0xff;
+    (*pconn)->base_uuid.node[2] = ib->sensor_id_hash & 0xff;
+    (*pconn)->base_uuid.node[3] = (ib->sensor_id_hash >> 8) & 0xff;
+    (*pconn)->base_uuid.node[4] = (ib->sensor_id_hash >> 16) & 0xff;
+    (*pconn)->base_uuid.node[5] = (ib->sensor_id_hash >> 24) & 0xff;
     /// @todo This needs set to thread ID or some other identifier
     (*pconn)->base_uuid.clk_seq_hi_res = 0x8f;
     (*pconn)->base_uuid.clk_seq_low = 0xff;
@@ -1598,7 +1629,7 @@ ib_status_t ib_module_init(ib_module_t *m, ib_engine_t *ib)
 
     /* Zero the config structure if there is one. */
     if (m->gclen > 0) {
-        memset((void *)m->gcdata, 0, m->gclen);
+        memset(m->gcdata, 0, m->gclen);
     }
 
     /* Register directives */
@@ -1657,12 +1688,17 @@ ib_status_t ib_module_load(ib_module_t **pm,
     IB_FTRACE_INIT(ib_module_load);
     ib_status_t rc;
     ib_dso_t *dso;
+    union {
+        void              *sym;
+        ib_dso_sym_t      *dso;
+        ib_module_sym_fn   fn_sym;
+    } sym;
 
     if (ib == NULL) {
         IB_FTRACE_RET_STATUS(IB_EINVAL);
     }
 
-    /* Load module and fetch the module structure */
+    /* Load module and fetch the module symbol. */
     ib_log_debug(ib, 7, "Loading module: %s", file);
     rc = ib_dso_open(&dso, file, ib->config_mp);
     if (rc != IB_OK) {
@@ -1670,11 +1706,19 @@ ib_status_t ib_module_load(ib_module_t **pm,
         IB_FTRACE_RET_STATUS(rc);
     }
 
-    rc = ib_dso_sym_find(dso, IB_MODULE_SYM_NAME, (ib_dso_sym_t **)pm);
+    rc = ib_dso_sym_find(dso, IB_MODULE_SYM_NAME, &sym.dso);
     if (rc != IB_OK) {
         ib_log_error(ib, 1, "Failed to load module %s: no symbol named %s", 
                      file, IB_MODULE_SYM_NAME);
         IB_FTRACE_RET_STATUS(rc);
+    }
+
+    /* Fetch the module structure. */
+    *pm = sym.fn_sym();
+    if (*pm == NULL) {
+        ib_log_error(ib, 1, "Failed to load module %s: no module structure", 
+                     file);
+        IB_FTRACE_RET_STATUS(IB_EUNKNOWN);
     }
 
     /* Check module for ABI compatibility with this engine */
@@ -1701,8 +1745,29 @@ ib_status_t ib_module_load(ib_module_t **pm,
 ib_status_t ib_module_unload(ib_module_t *m)
 {
     IB_FTRACE_INIT(ib_module_unload);
+    ib_engine_t *ib;
+    ib_status_t rc;
+
     if (m == NULL) {
         IB_FTRACE_RET_STATUS(IB_EINVAL);
+    }
+
+    ib = m->ib;
+
+    ib_log_debug(ib, 9,
+                 "Unloading module %s: "
+                 "vernum=%d abinum=%d version=%s index=%d filename=%s",
+                 m->name,
+                 m->vernum, m->abinum, m->version,
+                 m->idx, m->filename);
+
+    /* Finish the module */
+    if (m->fn_fini != NULL) {
+        rc = m->fn_fini(ib, m);
+        if (rc != IB_OK) {
+            ib_log_error(ib, 1, "Failed to finish module %s %d",
+                         m->name, rc);
+        }
     }
 
     /// @todo Implement
@@ -1780,6 +1845,7 @@ ib_status_t ib_context_create(ib_context_t **pctx,
                               ib_engine_t *ib,
                               ib_context_t *parent,
                               ib_context_fn_t fn_ctx,
+                              ib_context_site_fn_t fn_ctx_site,
                               void *fn_ctx_data)
 {
     IB_FTRACE_INIT(ib_context_create);
@@ -1810,6 +1876,7 @@ ib_status_t ib_context_create(ib_context_t **pctx,
     (*pctx)->ib = ib;
     (*pctx)->parent = parent;
     (*pctx)->fn_ctx = fn_ctx;
+    (*pctx)->fn_ctx_site = fn_ctx_site;
     (*pctx)->fn_ctx_data = fn_ctx_data;
 
     /* Create a cfgmap to hold the configuration */
@@ -1915,10 +1982,64 @@ void ib_context_parent_set(ib_context_t *ctx,
     IB_FTRACE_RET_VOID();
 }
 
+ib_site_t *ib_context_site_get(ib_context_t *ctx)
+{
+    IB_FTRACE_INIT(ib_context_site);
+    ib_status_t rc;
+    ib_site_t *site;
+
+    ib_clog_debug(ctx, 7, "ctx=%p; fn_ctx_site=%p", ctx, ctx->fn_ctx_site);
+
+    if (ctx->fn_ctx_site == NULL) {
+        IB_FTRACE_RET_PTR(ib_site_t, NULL);
+    }
+
+    /* Call the registered site lookup function. */
+    rc = ctx->fn_ctx_site(ctx, &site, ctx->fn_ctx_data);
+    if (rc != IB_OK) {
+        IB_FTRACE_RET_PTR(ib_site_t, NULL);
+    }
+
+    IB_FTRACE_RET_PTR(ib_site_t, site);
+}
+
 void ib_context_destroy(ib_context_t *ctx)
 {
     IB_FTRACE_INIT(ib_context_destroy);
+    ib_engine_t *ib;
+    ib_context_data_t *cfgdata;
+    ib_status_t rc;
+    size_t ncfgdata, i;
+
+    if (ctx == NULL) {
+        IB_FTRACE_RET_VOID();
+    }
+
+    ib = ctx->ib;
+
+    ib_log_debug(ib, 9, "Destroying context ctx=%p", ctx);
+
+    /* Run through the context modules to call any ctx_fini functions. */
+    /// @todo Not sure this is needed anymore
+    IB_ARRAY_LOOP(ctx->cfgdata, ncfgdata, i, cfgdata) {
+        if (cfgdata == NULL) {
+            continue;
+        }
+        ib_module_t *m = cfgdata->module;
+
+        if (m->fn_ctx_fini != NULL) {
+            ib_log_debug(ib, 9, "Finishing context ctx=%p for module=%s (%p)",
+                         ctx, m->name, m);
+            rc = m->fn_ctx_fini(ib, m, ctx);
+            if (rc != IB_OK) {
+                /// @todo Log the error???  Fail???
+                ib_log_error(ib, 4, "Failed to call context fini: %d", rc);
+            }
+        }
+    }
+
     ib_mpool_destroy(ctx->mp);
+
     IB_FTRACE_RET_VOID();
 }
 
@@ -2106,4 +2227,29 @@ ib_status_t ib_context_siteloc_chooser(ib_context_t *ctx,
 
     IB_FTRACE_RET_STATUS(IB_ENOENT);
 }
+
+ib_status_t ib_context_site_lookup(ib_context_t *ctx,
+                                   ib_site_t **psite,
+                                   void *cbdata)
+{
+    IB_FTRACE_INIT(ib_context_site);
+    ib_loc_t *loc;
+
+    if (cbdata == NULL) {
+        /// @todo No site/location associated with this context
+        IB_FTRACE_RET_STATUS(IB_DECLINED);
+    }
+
+    loc = (ib_loc_t *)cbdata;
+    if (psite != NULL) {
+        *psite = loc->site;
+    }
+
+    if (loc->site != NULL) {
+        IB_FTRACE_RET_STATUS(IB_OK);
+    }
+
+    IB_FTRACE_RET_STATUS(IB_ENOENT);
+}
+
 

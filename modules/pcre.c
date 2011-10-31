@@ -86,7 +86,10 @@ static ib_status_t modpcre_compile(ib_provider_t *mpr,
     IB_FTRACE_INIT(modpcre_compile);
     pcre *cpatt;
     modpcre_cpatt_t *pcre_cpatt;
-
+#ifdef PCRE_HAVE_JIT
+    int pcre_fullinfo_ret;
+    int pcre_jit_ret;
+#endif /*PCRE_HAVE_JIT*/
     cpatt = pcre_compile(patt,
                          PCRE_DOTALL | PCRE_DOLLAR_ENDONLY,
                          errptr, erroffset, NULL);
@@ -106,21 +109,26 @@ static ib_status_t modpcre_compile(ib_provider_t *mpr,
     pcre_cpatt->patt = patt; /// @todo Copy
     pcre_cpatt->cpatt = cpatt;
 
-#ifdef PCRE_HAVE_SLJIT
+#ifdef PCRE_HAVE_JIT
     pcre_cpatt->edata = pcre_study(pcre_cpatt->cpatt, PCRE_STUDY_JIT_COMPILE, errptr);
     if(*errptr != NULL)  {
-        ib_util_log_error(4,"PCRE-SLJIT study failed : %s", *errptr);
+        ib_util_log_error(4,"PCRE-JIT study failed : %s", *errptr);
         IB_FTRACE_RET_STATUS(IB_EINVAL);
     }
-    if (!(pcre_cpatt->edata->flags & PCRE_EXTRA_EXECUTABLE_FUNC)) {
-        ib_util_log_error(4,"PCRE-SLJIT compiler does not support: %s. It will fallback to the normal PCRE", pcre_cpatt->patt);
+
+    /* The check to see if JIT compilation was a success changed in 8.20RC1 now uses pcre_fullinfo see doc/pcrejit.3 */
+    pcre_fullinfo_ret = pcre_fullinfo(pcre_cpatt->cpatt, pcre_cpatt->edata, PCRE_INFO_JIT, &pcre_jit_ret);
+    if (pcre_fullinfo_ret != 0) {
+        ib_util_log_error(4,"PCRE-JIT failed to get pcre_fullinfo");
+    } else if (pcre_jit_ret != 1) {
+        ib_util_log_error(4,"PCRE-JIT compiler does not support: %s. It will fallback to the normal PCRE", pcre_cpatt->patt);
     }
 #else
     pcre_cpatt->edata = pcre_study(pcre_cpatt->cpatt, 0, errptr);
     if(*errptr != NULL)  {
         ib_util_log_error(4,"PCRE study failed : %s", *errptr);
     }
-#endif /*PCRE_HAVE_SLJIT*/
+#endif /*PCRE_HAVE_JIT*/
 
     *(void **)pcpatt = (void *)pcre_cpatt;
 
@@ -131,7 +139,7 @@ static ib_status_t modpcre_match_compiled(ib_provider_t *mpr,
                                           void *cpatt,
                                           ib_flags_t flags,
                                           const uint8_t *data,
-                                          size_t dlen)
+                                          size_t dlen, void *ctx)
 {
     IB_FTRACE_INIT(modpcre_match_compiled);
     modpcre_cpatt_t *pcre_cpatt = (modpcre_cpatt_t *)cpatt;
@@ -158,10 +166,22 @@ static ib_status_t modpcre_add_pattern(ib_provider_inst_t *pi,
     IB_FTRACE_RET_STATUS(IB_ENOTIMPL);
 }
 
+static ib_status_t modpcre_add_pattern_ex(ib_provider_inst_t *mpi,
+                                          void *patterns,
+                                          const char *patt,
+                                          ib_void_fn_t callback,
+                                          void *arg,
+                                          const char **errptr,
+                                          int *erroffset)
+{
+    IB_FTRACE_INIT(modpcre_add);
+    IB_FTRACE_RET_STATUS(IB_ENOTIMPL);
+}
+
 static ib_status_t modpcre_match(ib_provider_inst_t *mpi,
                                  ib_flags_t flags,
                                  const uint8_t *data,
-                                 size_t dlen)
+                                 size_t dlen, void *ctx)
 {
     IB_FTRACE_INIT(modpcre_match);
     IB_FTRACE_RET_STATUS(IB_ENOTIMPL);
@@ -176,6 +196,7 @@ static IB_PROVIDER_IFACE_TYPE(matcher) modpcre_matcher_iface = {
 
     /* Provider Instance Interface */
     modpcre_add_pattern,
+    modpcre_add_pattern_ex,
     modpcre_match
 };
 
@@ -246,5 +267,6 @@ IB_MODULE_INIT(
     modpcre_init,                         /**< Initialize function */
     NULL,                                 /**< Finish function */
     NULL,                                 /**< Context init function */
+    NULL                                  /**< Context fini function */
 );
 

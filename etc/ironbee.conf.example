@@ -1,21 +1,25 @@
-### Sensor Info
-# 32-bit numeric value
-SensorId 0x98765432
-# Arbitrary name
-SensorName ExampleSensorName
-# Arbitrary hostname
-SensorHostname example.sensor.tld
-
 ### Logging
 #DebugLog /var/log/ironbee/debug.log
 DebugLogLevel 4
 # TODO: Default is still stderr logging - this will go to Apache error_log
 Set logger "mod_ironbee"
 
+### Sensor Info
+# Sensor ID, must follow UUID format
+SensorId AAAABBBB-1111-2222-3333-FFFF00000023
+# Arbitrary name
+SensorName ExampleSensorName
+# Arbitrary hostname
+SensorHostname example.sensor.tld
+
 ### Load Modules
 LoadModule "ibmod_pcre.so"
+LoadModule "ibmod_radix.so"
+LoadModule "ibmod_binradix.so"
+LoadModule "ibmod_ac.so"
 LoadModule "ibmod_htp.so"
 LoadModule "ibmod_poc_sig.so"
+LoadModule "ibmod_poc_ac_sig.so"
 
 # Lua
 LoadModule "ibmod_lua.so"
@@ -29,6 +33,7 @@ Set parser "htp"
 
 # Enable audit engine
 AuditEngine RelevantOnly
+#AuditLogIndex "|/usr/bin/logger"
 AuditLogIndex auditlog.log
 AuditLogBaseDir /tmp/ironbee
 AuditLogSubDirFormat "%Y%m%d-%H%M"
@@ -49,9 +54,20 @@ PocSigTrace On
 
 # Site 1
 <Site site1>
+    # Site ID, must follow UUID format
+    SiteId AAAABBBB-1111-2222-4444-000000000001
     Hostname * ip=127.0.0.1
 
+    # This signature is handled by modules/poc_sig.c
+    # syntax: sigphase field pcre_pattern title
     PocSigReqHead request_line bar "TESTING: Matched bar in request line."
+
+    # This signature is handled by modules/poc_ac_sig.c
+    # and it's basically like poc_sig but adds a prequalifier content processed
+    # by an AhoCorasick Matcher. "foo" is the prequalifier. (bar)+ is a pcre
+    # expression that will be inspected if AhoCorasick has match of foo
+    # syntax: sigphase field prequalifier pcre_pattern title
+    PocACSigReqHead request_line foo (bar)+ "TESTING: Matched foo and (bar)+ in request line."
 
     <Location /foo>
         DebugLogLevel 9
@@ -61,11 +77,15 @@ PocSigTrace On
 
 # Site 2
 <Site site2>
+    # Site ID, must follow UUID format
+    SiteId AAAABBBB-1111-2222-4444-000000000002
     Hostname * ip=127.0.1.1
 </Site>
 
 # Default
 <Site default>
+    # Site ID, must follow UUID format
+    SiteId AAAABBBB-1111-2222-4444-000000000000
     Hostname *
 </Site>
 

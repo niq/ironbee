@@ -83,10 +83,11 @@ typedef struct ib_conn_t ib_conn_t;
 typedef struct ib_conndata_t ib_conndata_t;
 typedef struct ib_txdata_t ib_txdata_t;
 typedef struct ib_tx_t ib_tx_t;
+typedef struct ib_site_t ib_site_t;
+typedef struct ib_loc_t ib_loc_t;
 typedef struct ib_tfn_t ib_tfn_t;
 typedef struct ib_logevent_t ib_logevent_t;
 typedef struct timeval ib_timeval_t;
-typedef struct ib_uuid_t ib_uuid_t;
 typedef struct ib_auditlog_t ib_auditlog_t;
 typedef struct ib_auditlog_part_t ib_auditlog_part_t;
 
@@ -177,30 +178,20 @@ typedef ib_status_t (*ib_context_fn_t)(ib_context_t *ctx,
                                        void *cbdata);
 
 /**
- * @internal
- * Universal Unique ID Structure.
+ * Configuration Context Site Function.
  *
- * This is a modified UUIDv1 (RFC-4122) that uses fields as follows:
+ * This function returns IB_OK if there is a site associated with
+ * the context.
  *
- * time_low: 32-bit second accuracy time that tx started
- * time_mid: 16-bit counter
- * time_hi_and_ver: 4-bit version (0100) + 12-bit least sig usec
- * clk_seq_hi_res: 2-bit reserved (10) + 6-bit reserved (111111)
- * clk_seq_low: 8-bit reserved (11111111)
- * node(0-1): 16-bit process ID
- * node(2-5): 32-bit ID (system default IPv4 address by default)
+ * @param ctx Configuration context
+ * @param psite Address which site is written if non-NULL
+ * @param cbdata Callback data (fn_ctx_data from context)
  *
- * This is loosely based of of Apache mod_unique_id, but with
- * future expansion in mind.
+ * @returns Status code
  */
-struct ib_uuid_t {
-    uint32_t  time_low;
-    uint16_t  time_mid;
-    uint16_t  time_hi_and_ver;
-    uint8_t   clk_seq_hi_res;
-    uint8_t   clk_seq_low;
-    uint8_t   node[6];
-};
+typedef ib_status_t (*ib_context_site_fn_t)(ib_context_t *ctx,
+                                            ib_site_t **psite,
+                                            void *cbdata);
 
 /** Connection Data Structure */
 struct ib_conndata_t {
@@ -269,6 +260,27 @@ struct ib_tx_t {
     const char         *hostname;        /**< Hostname used in the request */
     const char         *path;            /**< Path used in the request */
     ib_flags_t          flags;           /**< Transaction flags */
+};
+
+/** Site Structure */
+struct ib_site_t {
+    ib_uuid_t               id;           /**< Site UUID */
+    const char              *id_str;      /**< ascii format, for logging */
+    ib_engine_t             *ib;          /**< Engine */
+    ib_mpool_t              *mp;          /**< Memory pool */
+    const char              *name;        /**< Site name */
+    /// @todo IPs needs to be IP:Port and be associated with a host
+    ib_list_t               *ips;         /**< IP addresses */
+    ib_list_t               *hosts;       /**< Hostnames */
+    ib_list_t               *locations;   /**< List of locations */
+    ib_loc_t                *default_loc; /**< Default location */
+};
+
+/** Location Structure */
+struct ib_loc_t {
+    ib_site_t               *site;        /**< Site */
+    /// @todo: use regex
+    const char              *path;        /**< Location path */
 };
 
 /**
@@ -407,6 +419,7 @@ void DLL_PUBLIC ib_engine_destroy(ib_engine_t *ib);
  * @param ib Engine handle
  * @param parent Parent context (or NULL)
  * @param fn_ctx Context function
+ * @param fn_ctx_site Context site lookup function
  * @param fn_ctx_data Context function data
  *
  * @returns Status code
@@ -415,6 +428,7 @@ ib_status_t DLL_PUBLIC ib_context_create(ib_context_t **pctx,
                                          ib_engine_t *ib,
                                          ib_context_t *parent,
                                          ib_context_fn_t fn_ctx,
+                                         ib_context_site_fn_t fn_ctx_site,
                                          void *fn_ctx_data);
 
 /**
@@ -447,6 +461,15 @@ ib_context_t DLL_PUBLIC *ib_context_parent_get(ib_context_t *ctx);
  */
 void DLL_PUBLIC ib_context_parent_set(ib_context_t *ctx,
                                       ib_context_t *parent);
+
+/**
+ * Get the site associated with the context.
+ *
+ * @param ctx Configuration context
+ *
+ * @returns Site or NULL if none is associated
+ */
+ib_site_t DLL_PUBLIC *ib_context_site_get(ib_context_t *ctx);
 
 /**
  * Destroy a configuration context.
@@ -569,6 +592,20 @@ ib_status_t DLL_PUBLIC ib_context_siteloc_chooser(ib_context_t *ctx,
                                                   void *ctxdata,
                                                   void *cbdata);
                                                   
+
+/**
+ * Default Site/Location context chooser.
+ *
+ * @param ctx Configuration context
+ * @param psite Address which site is written
+ * @param cbdata Chooser callback data
+ *
+ * @returns Status code
+ */
+ib_status_t DLL_PUBLIC ib_context_site_lookup(ib_context_t *ctx,
+                                              ib_site_t **psite,
+                                              void *cbdata);
+
 /**
  * Create a connection structure.
  *
@@ -1447,6 +1484,11 @@ ib_status_t DLL_PUBLIC ib_matcher_create(ib_engine_t *ib,
                                          const char *key,
                                          ib_matcher_t **pm);
 
+ib_status_t DLL_PUBLIC ib_matcher_instance_create(ib_engine_t *ib,
+                                                  ib_mpool_t *pool,
+                                                  const char *key,
+                                                  ib_matcher_t **pm);
+
 void DLL_PUBLIC *ib_matcher_compile(ib_matcher_t *m,
                                     const char *patt,
                                     const char **errptr,
@@ -1456,24 +1498,35 @@ ib_status_t DLL_PUBLIC ib_matcher_match_buf(ib_matcher_t *m,
                                             void *cpatt,
                                             ib_flags_t flags,
                                             const uint8_t *data,
-                                            size_t dlen);
+                                            size_t dlen,
+                                            void *ctx);
 
 ib_status_t DLL_PUBLIC ib_matcher_match_field(ib_matcher_t *m,
                                               void *cpatt,
                                               ib_flags_t flags,
-                                              ib_field_t *f);
+                                              ib_field_t *f,
+                                              void *ctx);
 
 ib_status_t DLL_PUBLIC ib_matcher_add_pattern(ib_matcher_t *m,
                                               const char *patt);
 
+ib_status_t DLL_PUBLIC ib_matcher_add_pattern_ex(ib_matcher_t *m,
+                                                 const char *patt,
+                                                 ib_void_fn_t callback,
+                                                 void *arg,
+                                                 const char **errptr,
+                                                 int *erroffset);
+
 ib_status_t DLL_PUBLIC ib_matcher_exec_buf(ib_matcher_t *m,
                                            ib_flags_t flags,
                                            const uint8_t *data,
-                                           size_t dlen);
+                                           size_t dlen,
+                                           void *ctx);
 
 ib_status_t DLL_PUBLIC ib_matcher_exec_field(ib_matcher_t *m,
                                              ib_flags_t flags,
-                                             ib_field_t *f);
+                                             ib_field_t *f,
+                                             void *ctx);
 
 /**
  * @} IronBeeEngineMatcher

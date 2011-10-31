@@ -54,7 +54,9 @@ struct ib_engine_t {
     ib_provider_inst_t *dpi;              /**< Data provider instance */
     ib_context_t       *ectx;             /**< Engine configuration context */
     ib_context_t       *ctx;              /**< Main configuration context */
-    uint32_t            sensor_id;        /**< Sensor ID */
+    ib_uuid_t           sensor_id;        /**< Sensor UUID */
+    uint32_t            sensor_id_hash;   /**< Sensor UUID hash (4 bytes) */
+    const char         *sensor_id_str;    /**< ascii format, for logging */
     const char         *sensor_name;      /**< Sensor name */
     const char         *sensor_version;   /**< Sensor version string */
     const char         *sensor_hostname;  /**< Sensor hostname */
@@ -68,33 +70,6 @@ struct ib_engine_t {
     ib_hash_t          *apis;             /**< Hash tracking provider APIs */
     ib_hash_t          *providers;        /**< Hash tracking providers */
     ib_hash_t          *tfns;             /**< Hash tracking transformations */
-};
-
-/**
- * @internal
- *
- * Site.
- */
-struct ib_site_t {
-    ib_engine_t             *ib;          /**< Engine */
-    ib_mpool_t              *mp;          /**< Memory pool */
-    const char              *name;        /**< Site name */
-    /// @todo IPs needs to be IP:Port and be associated with a host
-    ib_list_t               *ips;         /**< IP addresses */
-    ib_list_t               *hosts;       /**< Hostnames */
-    ib_list_t               *locations;   /**< List of locations */
-    ib_loc_t                *default_loc; /**< Default location */
-};
-
-/**
- * @internal
- *
- * Location.
- */
-struct ib_loc_t {
-    ib_site_t               *site;        /**< Site */
-    /// @todo: use regex
-    const char              *path;        /**< Location path */
 };
 
 /**
@@ -130,9 +105,11 @@ struct ib_context_t {
     ib_cfgmap_t             *cfg;         /**< Config map */
     ib_array_t              *cfgdata;     /**< Config data */
     ib_context_t            *parent;      /**< Parent context */
+    ib_logformat_t          *index_fmt;   /**< Used to specify the logformat */
 
     /* Context Selection */
     ib_context_fn_t          fn_ctx;      /**< Context decision function */
+    ib_context_site_fn_t     fn_ctx_site; /**< Context site function */
     void                    *fn_ctx_data; /**< Context function data */
 
     /* Filters */

@@ -24,6 +24,10 @@
 
 #include "ironbee_config_auto.h"
 
+#ifndef _POSIX_SOURCE
+#define _POSIX_SOURCE
+#endif
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -54,6 +58,16 @@
 
 #define MODULE_NAME        core
 #define MODULE_NAME_STR    IB_XSTRINGIFY(MODULE_NAME)
+
+IB_MODULE_DECLARE();
+
+/* The default shell to use for piped commands. */
+static const char * const ib_pipe_shell = "/bin/sh";
+
+/* The default UUID value */
+static const char * const ib_uuid_default_str = "00000000-0000-0000-0000-000000000000";
+
+static void ib_timestamp(char *, ib_timeval_t *);
 
 /// @todo Fix this:
 #ifndef X_MODULE_BASE_PATH
@@ -182,14 +196,18 @@ static IB_PROVIDER_IFACE_TYPE(logevent) core_logevent_iface = {
 /* -- Audit Provider -- */
 
 typedef struct core_audit_cfg_t core_audit_cfg_t;
+/**
+ * @internal
+ * Core audit configuration structure
+ */
 struct core_audit_cfg_t {
-    FILE           *index_fp;
-    FILE           *fp;
-    const char     *fn;
-    int             parts_written;
-    const char     *boundary;
-    ib_tx_t        *tx;
-    ib_timeval_t   *logtime;
+    FILE           *index_fp;       /**< Index file pointer */
+    FILE           *fp;             /**< Audit log file pointer */
+    const char     *fn;             /**< Audit log file name */
+    int             parts_written;  /**< Parts written so far */
+    const char     *boundary;       /**< Audit log boundary */
+    ib_tx_t        *tx;             /**< Transaction being logged */
+    ib_timeval_t   *logtime;        /**< Audit log time */
 };
 
 /// @todo Make this public
@@ -219,7 +237,7 @@ static ib_status_t ib_auditlog_part_add(ib_auditlog_t *log,
 
     rc = ib_list_push(log->parts, part);
 
-    IB_FTRACE_RET_STATUS(IB_OK);
+    IB_FTRACE_RET_STATUS(rc);
 }
 
 static ib_status_t core_audit_open(ib_provider_inst_t *lpi,
@@ -236,7 +254,10 @@ static ib_status_t core_audit_open(ib_provider_inst_t *lpi,
     rc = ib_context_module_config(log->ctx, ib_core_module(),
                                   (void *)&corecfg);
 
-    if ((corecfg->auditlog_index != NULL) && (cfg->index_fp == NULL)) {
+    if (corecfg->auditlog_index_fp != NULL) {
+        cfg->index_fp = corecfg->auditlog_index_fp;
+    }
+    else if ((corecfg->auditlog_index != NULL) && (cfg->index_fp == NULL)) {
         if (corecfg->auditlog_index[0] == '/') {
             fnsize = strlen(corecfg->auditlog_index) + 1;
 
@@ -244,6 +265,19 @@ static ib_status_t core_audit_open(ib_provider_inst_t *lpi,
             if (fn == NULL) {
                 return IB_EALLOC;
             }
+
+            memcpy(fn, corecfg->auditlog_index, fnsize);
+        }
+        else if (corecfg->auditlog_index[0] == '|') {
+            /// @todo Probably should skip whitespace???
+            fnsize = strlen(corecfg->auditlog_index + 1) + 1;
+
+            fn = (char *)ib_mpool_alloc(cfg->tx->mp, fnsize);
+            if (fn == NULL) {
+                return IB_EALLOC;
+            }
+
+            memcpy(fn, corecfg->auditlog_index + 1, fnsize);
         }
         else {
             fnsize = strlen(corecfg->auditlog_dir) +
@@ -274,17 +308,88 @@ static ib_status_t core_audit_open(ib_provider_inst_t *lpi,
             }
         }
 
-        /// @todo Use corecfg->auditlog_fmode as file mode for new file
-        cfg->index_fp = fopen(fn, "ab");
-        if (cfg->index_fp == NULL) {
-            ec = errno;
-            ib_log_error(log->ib, 1,
-                         "Could not open audit log index \"%s\": %s (%d)",
-                         fn, strerror(ec), ec);
-            IB_FTRACE_RET_STATUS(IB_EINVAL);
+        if (corecfg->auditlog_index[0] == '|') {
+            int p[2];
+            pid_t pipe_pid;
+
+            /// @todo Handle exit of pipe_pid???
+
+            ec = pipe(p);
+            if (ec != 0) {
+                ib_log_error(log->ib, 1,
+                             "Could not create piped audit log index: %s (%d)",
+                             strerror(ec), ec);
+                IB_FTRACE_RET_STATUS(IB_EINVAL);
+            }
+            
+            /* Create a new process for executing the piped command. */
+            pipe_pid = fork();
+            if (pipe_pid == 0) {
+                /* Child - piped audit log index process */
+                char *parg[4];
+
+                /// @todo Reset SIGCHLD in child???
+
+                /* Setup the filehandles to read from pipe. */
+                close(3); /// @todo stderr
+                close(p[1]);
+                dup2(p[0], 0);
+
+                /* Execute piped command. */
+                parg[0] = (char *)ib_pipe_shell;
+                parg[1] = (char *)"-c";
+                parg[2] = fn;
+                parg[3] = NULL;
+                ib_log_debug(log->ib, 4,
+                             "Executing piped audit log index: %s %s \"%s\"",
+                             parg[0], parg[1], parg[2]);
+                execvp(ib_pipe_shell, (char * const *)parg); /// @todo define shell
+                ec = errno;
+                ib_log_error(log->ib, 1,
+                             "Could not execute piped audit log index \"%s\": %s (%d)",
+                             fn, strerror(ec), ec);
+                exit(1);
+            }
+            else if (pipe_pid == -1) {
+                /* Error - no process created */
+                ec = errno;
+                ib_log_error(log->ib, 1,
+                             "Could not create piped audit log index process: %s (%d)",
+                             strerror(ec), ec);
+                IB_FTRACE_RET_STATUS(IB_EINVAL);
+            }
+
+            /* Parent - IronBee process */
+
+            /* Setup the filehandles to write to the pipe. */
+            close(p[0]);
+            cfg->index_fp = fdopen(p[1], "w");
+            if (cfg->index_fp == NULL) {
+                ec = errno;
+                ib_log_error(log->ib, 1,
+                             "Could not open piped audit log index: %s (%d)",
+                             strerror(ec), ec);
+                IB_FTRACE_RET_STATUS(IB_EINVAL);
+            }
+        }
+        else {
+            /// @todo Use corecfg->auditlog_fmode as file mode for new file
+            cfg->index_fp = fopen(fn, "ab");
+            if (cfg->index_fp == NULL) {
+                ec = errno;
+                ib_log_error(log->ib, 1,
+                             "Could not open audit log index \"%s\": %s (%d)",
+                             fn, strerror(ec), ec);
+                IB_FTRACE_RET_STATUS(IB_EINVAL);
+            }
         }
 
-        ib_log_debug(log->ib, 4, "AUDITLOG INDEX: %s", fn);
+        /// @todo Need to lock around this as the corecfg is a
+        ///       shared structure.
+        corecfg->auditlog_index_fp = cfg->index_fp;
+
+        ib_log_debug(log->ib, 3, "AUDITLOG INDEX%s: %s",
+                     (corecfg->auditlog_index[0] == '|'?" (piped)":""), fn);
     }
 
     if (cfg->fp == NULL) {
@@ -363,6 +468,25 @@ static ib_status_t core_audit_open(ib_provider_inst_t *lpi,
         ib_log_debug(log->ib, 4, "AUDITLOG: %s", fn);
     }
 
+    /* Set the Audit Log index format */
+    if (corecfg->auditlog_index_hp == NULL) {
+        rc = ib_logformat_create(log->ib->mp, &corecfg->auditlog_index_hp);
+        if (rc != IB_OK) {
+            IB_FTRACE_RET_STATUS(rc);
+        }
+        if (corecfg->auditlog_index_fmt != NULL) {
+            rc = ib_logformat_set(corecfg->auditlog_index_hp,
+                                  corecfg->auditlog_index_fmt);
+        }
+        else {
+            rc = ib_logformat_set(corecfg->auditlog_index_hp,
+                                  IB_LOGFORMAT_DEFAULT);
+        }
+        if (rc != IB_OK) {
+            IB_FTRACE_RET_STATUS(rc);
+        }
+    }
+
     IB_FTRACE_RET_STATUS(IB_OK);
 }
 
@@ -432,13 +556,145 @@ static ib_status_t core_audit_write_footer(ib_provider_inst_t *lpi,
     IB_FTRACE_RET_STATUS(IB_OK);
 }
 
+
+/**
+ * @internal
+ * Render the log index line. Line must have a size of 
+ * IB_LOGFORMAT_MAX_INDEX_LENGTH + 1
+ *
+ * @param lpi provider instance
+ * @param log audit log instance
+ * @param line buffer to store the line before writing to disk/pipe..
+ *
+ * @returns Status code
+ */
+static ib_status_t core_audit_get_index_line(ib_provider_inst_t *lpi,
+                                             ib_auditlog_t *log,
+                                             char *line,
+                                             int *line_size)
+{
+    IB_FTRACE_INIT(core_audit_get_index_fields);
+    core_audit_cfg_t *cfg = (core_audit_cfg_t *)log->cfg_data;
+    ib_core_cfg_t *corecfg;
+    ib_tx_t *tx = log->tx;
+    ib_conn_t *conn = tx->conn;
+    ib_site_t *site = ib_context_site_get(log->ctx);
+    ib_logformat_t *lf;
+    ib_status_t rc;
+    char *ptr = line;
+    char *tstamp = NULL;
+    uint8_t which;
+    int i = 0;
+    int l = 0;
+    int used = 0;
+    const char *aux = NULL;
+
+    /* Retrieve corecfg to get the AuditLogIndexFormat */
+    rc = ib_context_module_config(log->ctx, ib_core_module(),
+                                  (void *)&corecfg);
+
+    if (rc != IB_OK) {
+        IB_FTRACE_RET_STATUS(rc);
+    }
+
+    lf = corecfg->auditlog_index_hp;
+    which = lf->literal_starts ? 1 : 0;
+
+    for (; (i < lf->field_cnt || l < lf->literal_cnt) &&
+            used < IB_LOGFORMAT_MAXLINELEN;)
+    {
+        if (which++ % 2 == 0) {
+            int aux_i = 0;
+
+            switch (lf->fields[i]) {
+                case IB_LOG_FIELD_REMOTE_ADDR:
+                    aux = conn->remote_ipstr;
+                    break;
+                case IB_LOG_FIELD_LOCAL_ADDR:
+                    aux = conn->local_ipstr;
+                    break;
+                case IB_LOG_FIELD_HOSTNAME:
+                     aux = tx->hostname;
+                    break;
+                case IB_LOG_FIELD_SITE_ID:
+                    if (site == NULL) {
+                         aux = (char *)"-";
+                    }
+                    else {
+                         aux = site->id_str;
+                    }
+                    break;
+                case IB_LOG_FIELD_SENSOR_ID:
+                     aux = log->ib->sensor_id_str;
+                    break;
+                case IB_LOG_FIELD_TRANSACTION_ID:
+                     aux = tx->id;
+                    break;
+                case IB_LOG_FIELD_TIMESTAMP:
+                    /* Prepare timestamp (only if needed) */
+                    tstamp = (char *)ib_mpool_alloc(log->mp, 31);
+                    if (tstamp == NULL) {
+                        IB_FTRACE_RET_STATUS(IB_EALLOC);
+                    }
+                
+                    ib_timestamp(tstamp, &tx->started);
+                     aux = tstamp;
+                    break;
+                case IB_LOG_FIELD_LOG_FILE:
+                     aux = cfg->fn;
+                    break;
+                default:
+                    ptr[used++] = '\n';
+                    /* Not understood */
+                    IB_FTRACE_RET_STATUS(IB_EINVAL);
+                    break;
+            }
+
+            for (; aux != NULL && aux[aux_i] != '\0';) {
+                if (used < IB_LOGFORMAT_MAXLINELEN) {
+                    ptr[used++] = aux[aux_i++];
+                }
+                else {
+                    ptr[used++] = '\n';
+                    IB_FTRACE_RET_STATUS(IB_ETRUNC);
+                }
+            }
+            ++i;
+        }
+        else {
+            /* Use literals */
+            if (used + lf->literals_len[l] < IB_LOGFORMAT_MAXLINELEN) { 
+                memcpy(&ptr[used], lf->literals[l], lf->literals_len[l]);
+                used += lf->literals_len[l];
+                ++l;
+            }
+            else {
+                /* Truncated.. */
+                ptr[used++] = '\n';
+                IB_FTRACE_RET_STATUS(IB_ETRUNC);
+            }
+        }
+    }
+    ptr[used++] = '\n';
+    *line_size = used;
+
+    IB_FTRACE_RET_STATUS(IB_OK);
+}
+
 static ib_status_t core_audit_close(ib_provider_inst_t *lpi,
                                     ib_auditlog_t *log)
 {
     IB_FTRACE_INIT(core_audit_close);
     core_audit_cfg_t *cfg = (core_audit_cfg_t *)log->cfg_data;
-    ib_tx_t *tx = log->tx;
-    ib_conn_t *conn = tx->conn;
+    ib_core_cfg_t *corecfg;
+    int ec;
+    ib_status_t rc;
+    char line[IB_LOGFORMAT_MAXLINELEN + 2]; 
+    int line_size = 0;
+
+    /* Retrieve corecfg to get the AuditLogIndexFormat */
+    rc = ib_context_module_config(log->ctx, ib_core_module(),
+                                  &corecfg);
 
     /* Close the audit log. */
     if (cfg->fp != NULL) {
@@ -446,48 +702,31 @@ static ib_status_t core_audit_close(ib_provider_inst_t *lpi,
         cfg->fp = NULL;
     }
 
-    /** Write to the index file if using one:
-     *
-     *  @todo Implement fully and use only relevent metadata
-     *
-     *  hostname (or IP)
-     *  source IP
-     *  remote user
-     *  local user
-     *  timestamp
-     *  request line
-     *  response status
-     *  bytes sent
-     *  referrer
-     *  user agent
-     *  transaction id
-     *  session id
-     *  audit log filename (relative)
-     *  audit log offset
-     *  audit log size
-     *  audit log hash
-     */
+    /* Write to the index file if using one. */
     if ((cfg->index_fp != NULL) && (cfg->parts_written > 0)) {
-        fprintf(
-            cfg->index_fp,
-            "%s %s %s %s [%s] \"%s\" %d %d \"%s\" \"%s\" %s \"%s\" /%s %d %d %s\n",
-            tx->hostname,
-            conn->remote_ipstr,
-            "-",
-            "-",
-            "-",
-            "-",
-            0,
-            0,
-            "-",
-            "-",
-            tx->id,
-            "-",
-            cfg->fn,
-            0,
-            0,
-            "-"
-        );
+        rc = core_audit_get_index_line(lpi, log, line, &line_size);
+        /* @todo: What to do if line is truncated? */
+        if (rc != IB_OK) {
+            IB_FTRACE_RET_STATUS(rc);
+        }
+        ec = fwrite(line, line_size, 1, cfg->index_fp);
+        if (ec < 0) {
+            ec = errno;
+            ib_log_error(log->ib, 1,
+                         "Could not write to audit log index: %s (%d)",
+                         strerror(ec), ec);
+
+            /// @todo Should retry (a piped logger may have died)
+            fclose(cfg->index_fp);
+            cfg->index_fp = NULL;
+
+            /// @todo Need to lock around this as the corecfg is a
+            ///       shared structure.
+            corecfg->auditlog_index_fp = cfg->index_fp;
+
+            IB_FTRACE_RET_STATUS(IB_OK);
+        }
+
         fflush(cfg->index_fp);
     }
 
@@ -570,7 +809,7 @@ static ib_status_t core_data_set_relative(ib_provider_inst_t *dpi,
 
     rc = ib_hash_get_ex((ib_hash_t *)dpi->data,
                         (void *)name, nlen,
-                        (void *)&f);
+                        (void *)&f, IB_HASH_FLAG_NOCASE);
     if (rc != IB_OK) {
         IB_FTRACE_RET_STATUS(IB_ENOENT);
     }
@@ -625,7 +864,7 @@ static ib_status_t core_data_get(ib_provider_inst_t *dpi,
 
         rc = ib_hash_get_ex((ib_hash_t *)dpi->data,
                             (void *)name, klen,
-                            (void *)pf);
+                            (void *)pf, IB_HASH_FLAG_NOCASE);
         if (rc == IB_OK) {
             if ((*pf)->type == IB_FTYPE_LIST) {
                 ib_list_node_t *node;
@@ -647,7 +886,7 @@ static ib_status_t core_data_get(ib_provider_inst_t *dpi,
 
     rc = ib_hash_get_ex((ib_hash_t *)dpi->data,
                                     (void *)name, nlen,
-                                    (void *)pf);
+                                    (void *)pf, IB_HASH_FLAG_NOCASE);
     IB_FTRACE_RET_STATUS(rc);
 }
 
@@ -1522,7 +1761,7 @@ static void ib_timestamp(char *buf, ib_timeval_t *tv)
     struct tm *tm = localtime((time_t *)&tv->tv_sec);
     
     strftime(buf, 30, "%Y-%m-%dT%H:%M:%S", tm);
-    snprintf(buf + 19, 12, ".%04" PRIdMAX, tv->tv_usec);
+    snprintf(buf + 19, 12, ".%04ld", tv->tv_usec);
     strftime(buf + 24, 6, "%z", tm);
 }
 
@@ -1533,12 +1772,12 @@ static ib_status_t ib_auditlog_add_part_header(ib_auditlog_t *log)
     IB_FTRACE_INIT(ib_auditlog_add_part_header);
     core_audit_cfg_t *cfg = (core_audit_cfg_t *)log->cfg_data;
     ib_engine_t *ib = log->ib;
+    ib_site_t *site;
     ib_mpool_t *pool = log->mp;
     ib_field_t *f;
     ib_list_t *list;
     char *tstamp;
     char *log_format;
-    ib_num_t sensorid = (ib_num_t)ib->sensor_id;
     ib_status_t rc;
 
     /* Timestamp */
@@ -1549,9 +1788,7 @@ static ib_status_t ib_auditlog_add_part_header(ib_auditlog_t *log)
     ib_timestamp(tstamp, &log->logtime);
 
     /* Log Format */
-    log_format = (char *)ib_mpool_memdup(pool,
-                                         CORE_AUDITLOG_FORMAT,
-                                         strlen(CORE_AUDITLOG_FORMAT) + 1);
+    log_format = ib_mpool_strdup(pool, CORE_AUDITLOG_FORMAT);
     if (log_format == NULL) {
         IB_FTRACE_RET_STATUS(IB_EALLOC);
     }
@@ -1580,10 +1817,10 @@ static ib_status_t ib_auditlog_add_part_header(ib_auditlog_t *log)
                        strlen(cfg->boundary));
     ib_list_push(list, f);
 
-    ib_field_create(&f, pool,
-                    "sensor-id",
-                    IB_FTYPE_UNUM,
-                    &sensorid);
+    ib_field_alias_mem(&f, pool,
+                       "sensor-id",
+                       (uint8_t *)ib->sensor_id_str,
+                       strlen(ib->sensor_id_str));
     ib_list_push(list, f);
 
     ib_field_alias_mem(&f, pool,
@@ -1603,6 +1840,21 @@ static ib_status_t ib_auditlog_add_part_header(ib_auditlog_t *log)
                        (uint8_t *)ib->sensor_hostname,
                        strlen(ib->sensor_hostname));
     ib_list_push(list, f);
+
+    site = ib_context_site_get(log->ctx);
+    if (site != NULL) {
+        ib_field_alias_mem(&f, pool,
+                           "site-id",
+                           (uint8_t *)site->id_str,
+                           strlen(site->id_str));
+        ib_list_push(list, f);
+
+        ib_field_alias_mem(&f, pool,
+                           "site-name",
+                           (uint8_t *)site->name,
+                           strlen(site->name));
+        ib_list_push(list, f);
+    }
 
     /* Add the part to the auditlog. */
     rc = ib_auditlog_part_add(log,
@@ -1643,7 +1895,7 @@ static ib_status_t ib_auditlog_add_part_http_request_meta(ib_auditlog_t *log)
     IB_FTRACE_INIT(ib_auditlog_add_part_http_request_meta);
     ib_engine_t *ib = log->ib;
     ib_tx_t *tx = log->tx;
-    ib_unum_t message_num = tx ? tx->conn->tx_count : 0;
+    ib_unum_t tx_num = tx ? tx->conn->tx_count : 0;
     ib_mpool_t *pool = log->mp;
     ib_field_t *f;
     ib_list_t *list;
@@ -1670,15 +1922,15 @@ static ib_status_t ib_auditlog_add_part_http_request_meta(ib_auditlog_t *log)
     ib_list_push(list, f);
 
     ib_field_alias_mem(&f, pool,
-                       "message-id",
+                       "tx-id",
                        (uint8_t *)tx->id,
                        strlen(tx->id));
     ib_list_push(list, f);
 
     ib_field_create(&f, pool,
-                    "message-num",
+                    "tx-num",
                     IB_FTYPE_UNUM,
-                    &message_num);
+                    &tx_num);
     ib_list_push(list, f);
 
     ib_field_alias_mem(&f, pool,
@@ -2706,7 +2958,7 @@ static ib_status_t matcher_api_match_compiled(ib_provider_t *mpr,
                                               void *cpatt,
                                               ib_flags_t flags,
                                               const uint8_t *data,
-                                              size_t dlen)
+                                              size_t dlen, void *ctx)
 {
     IB_FTRACE_INIT(matcher_api_match_compiled);
     IB_PROVIDER_IFACE_TYPE(matcher) *iface = mpr?(IB_PROVIDER_IFACE_TYPE(matcher) *)mpr->iface:NULL;
@@ -2722,9 +2974,48 @@ static ib_status_t matcher_api_match_compiled(ib_provider_t *mpr,
         IB_FTRACE_RET_STATUS(IB_ENOTIMPL);
     }
 
-    rc = iface->match_compiled(mpr, cpatt, flags, data, dlen);
+    rc = iface->match_compiled(mpr, cpatt, flags, data, dlen, ctx);
     IB_FTRACE_RET_STATUS(rc);
 }
+
+/**
+ * @internal
+ * Add a pattern to a matcher provider instance.
+ *
+ * Multiple patterns can be added to a provider instance and all used
+ * to perform a match later on.
+ *
+ * @param mpi Matcher provider instance
+ * @param patt Pattern
+ *
+ * @returns Status code
+ */
+static ib_status_t matcher_api_add_pattern_ex(ib_provider_inst_t *mpi,
+                                              void *patterns,
+                                              const char *patt,
+                                              ib_void_fn_t callback,
+                                              void *arg,
+                                              const char **errptr,
+                                              int *erroffset)
+{
+    IB_FTRACE_INIT(matcher_api_add_pattern);
+
+    IB_PROVIDER_IFACE_TYPE(matcher) *iface = NULL;
+
+    ib_status_t rc; 
+    iface = mpi->pr?(IB_PROVIDER_IFACE_TYPE(matcher) *)mpi->pr->iface:NULL;
+    
+    rc = iface->add_ex(mpi, patterns, patt, callback, arg,
+                               errptr, erroffset);
+    if (rc != IB_OK) {
+        ib_log_debug(mpi->pr->ib, 4, "Failed to add pattern %s patt: (%d) %s at"
+                               " offset %d", patt, rc, errptr, erroffset);
+        IB_FTRACE_RET_STATUS(rc);
+    }
+
+    IB_FTRACE_RET_STATUS(IB_OK);
+}
+
 
 /**
  * @internal
@@ -2761,7 +3052,8 @@ static ib_status_t matcher_api_add_pattern(ib_provider_inst_t *mpi,
 static ib_status_t matcher_api_match(ib_provider_inst_t *mpi,
                                      ib_flags_t flags,
                                      const uint8_t *data,
-                                     size_t dlen)
+                                     size_t dlen,
+                                     void *ctx)
                                      
 {
     IB_FTRACE_INIT(matcher_api_match);
@@ -2776,6 +3068,7 @@ static IB_PROVIDER_API_TYPE(matcher) matcher_api = {
     matcher_api_compile_pattern,
     matcher_api_match_compiled,
     matcher_api_add_pattern,
+    matcher_api_add_pattern_ex,
     matcher_api_match,
 };
 
@@ -3113,7 +3406,9 @@ static ib_status_t core_dir_site_start(ib_cfgparser_t *cp,
 
     ib_log_debug(ib, 6, "Creating context for \"%s:%s\"", p1, loc->path);
     rc = ib_context_create(&ctx, ib, cp->cur_ctx,
-                           ib_context_siteloc_chooser, loc);
+                           ib_context_siteloc_chooser,
+                           ib_context_site_lookup,
+                           loc);
     if (rc != IB_OK) {
         ib_log_error(ib, 4, "Failed to create context for \"%s:%s\": %d", p1, loc->path, rc);
     }
@@ -3197,7 +3492,9 @@ static ib_status_t core_dir_loc_start(ib_cfgparser_t *cp,
 
     ib_log_debug(ib, 6, "Creating context for \"%s:%s\"", site->name, loc->path);
     rc = ib_context_create(&ctx, ib, cp->cur_ctx,
-                           ib_context_siteloc_chooser, loc);
+                           ib_context_siteloc_chooser,
+                           ib_context_site_lookup,
+                           loc);
     if (rc != IB_OK) {
         ib_log_debug(ib, 6, "Failed to create context for \"%s:%s\": %d", site->name, loc->path, rc);
     }
@@ -3359,6 +3656,12 @@ static ib_status_t core_dir_param1(ib_cfgparser_t *cp,
         rc = ib_context_set_string(ctx, "auditlog_index", p1);
         IB_FTRACE_RET_STATUS(rc);
     }
+    else if (strcasecmp("AuditLogIndexFormat", name) == 0) {
+        ib_context_t *ctx = cp->cur_ctx ? cp->cur_ctx : ib_context_main(ib);
+        ib_log_debug(ib, 7, "%s: \"%s\" ctx=%p", name, p1, ctx);
+        rc = ib_context_set_string(ctx, "auditlog_index_fmt", p1);
+        IB_FTRACE_RET_STATUS(rc);
+    }
     else if (strcasecmp("AuditLogDirMode", name) == 0) {
         ib_context_t *ctx = cp->cur_ctx ? cp->cur_ctx : ib_context_main(ib);
         long lmode = strtol(p1, NULL, 0);
@@ -3446,22 +3749,79 @@ static ib_status_t core_dir_param1(ib_cfgparser_t *cp,
         IB_FTRACE_RET_STATUS(rc);
     }
     else if (strcasecmp("SensorId", name) == 0) {
-        ib->sensor_id = htonl(strtol(p1, NULL, 0));
-        ib_log_debug(ib, 7, "%s: %08x", name, ib->sensor_id);
+        /* Store the ASCII version for logging */
+        ib->sensor_id_str = ib_mpool_strdup(ib_engine_pool_config_get(ib), p1);
+
+        /* Calculate the binary version. */
+        rc = ib_uuid_ascii_to_bin(&ib->sensor_id, (const char *)p1);
+        if (rc != IB_OK) {
+            ib_log_error(ib, 1, "Invalid UUID at %s: %s should have "
+                            "UUID format "
+                            "(xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx where x are"
+                            " hexa values)",
+                            name, p1);
+
+            /* Use the default id. */
+            ib->sensor_id_str = (const char *)ib_uuid_default_str;
+            rc = ib_uuid_ascii_to_bin(&ib->sensor_id, ib_uuid_default_str);
+
+            IB_FTRACE_RET_STATUS(rc);
+        }
+
+        ib_log_debug(ib, 7, "%s: %s", name, ib->sensor_id_str);
+
+        /* Generate a 4byte hash id to use it for transaction id generations */
+        uint64_t first_reduce = 0;
+        uint8_t *ptr = (uint8_t *)&ib->sensor_id;
+        uint8_t *result = (uint8_t *)&first_reduce;
+        
+        int i = 0;
+        for (i = 0; i < 8; i++) {
+            result[i] = ptr[i] ^ ptr[i + 8];
+        }
+
+        ptr = (uint8_t *)&first_reduce;
+        result = (uint8_t *)&ib->sensor_id_hash;
+        for (i = 0; i < 4; i++) {
+            result[i] = ptr[i] ^ ptr[i + 8];
+        }
+
         IB_FTRACE_RET_STATUS(IB_OK);
     }
     else if (strcasecmp("SensorName", name) == 0) {
-        ib->sensor_name =
-            (const char *)ib_mpool_memdup(ib_engine_pool_config_get(ib),
-                                          p1, strlen(p1));
+        ib->sensor_name = ib_mpool_strdup(ib_engine_pool_config_get(ib), p1);
         ib_log_debug(ib, 7, "%s: %s", name, ib->sensor_name);
         IB_FTRACE_RET_STATUS(IB_OK);
     }
     else if (strcasecmp("SensorHostname", name) == 0) {
         ib->sensor_hostname =
-            (const char *)ib_mpool_memdup(ib_engine_pool_config_get(ib),
-                                          p1, strlen(p1));
+            ib_mpool_strdup(ib_engine_pool_config_get(ib), p1);
         ib_log_debug(ib, 7, "%s: %s", name, ib->sensor_hostname);
+        IB_FTRACE_RET_STATUS(IB_OK);
+    }
+    else if (strcasecmp("SiteId", name) == 0) {
+        ib_site_t *site = cp->cur_site;
+
+        /* Store the ASCII version for logging */
+        site->id_str = ib_mpool_strdup(ib_engine_pool_config_get(ib), p1);
+
+        /* Calculate the binary version. */
+        rc = ib_uuid_ascii_to_bin(&site->id, (const char *)p1);
+        if (rc != IB_OK) {
+            ib_log_error(ib, 1, "Invalid UUID at %s: %s should have "
+                            "UUID format "
+                            "(xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx where x are"
+                            " hexa values)",
+                            name, p1);
+
+            /* Use the default id. */
+            site->id_str = (const char *)ib_uuid_default_str;
+            rc = ib_uuid_ascii_to_bin(&site->id, ib_uuid_default_str);
+
+            IB_FTRACE_RET_STATUS(rc);
+        }
+
+        ib_log_debug(ib, 7, "%s: %s", name, site->id_str);
         IB_FTRACE_RET_STATUS(IB_OK);
     }
 
@@ -3726,6 +4086,11 @@ static IB_DIRMAP_INIT_STRUCTURE(core_directive_map) = {
         core_dir_site_end,
         NULL
     ),
+    IB_DIRMAP_INIT_PARAM1(
+        "SiteId",
+        core_dir_param1,
+        NULL
+    ),
     IB_DIRMAP_INIT_SBLK1(
         "Location",
         core_dir_loc_start,
@@ -3753,6 +4118,11 @@ static IB_DIRMAP_INIT_STRUCTURE(core_directive_map) = {
     ),
     IB_DIRMAP_INIT_PARAM1(
         "AuditLogIndex",
+        core_dir_param1,
+        NULL
+    ),
+    IB_DIRMAP_INIT_PARAM1(
+        "AuditLogIndexFormat",
         core_dir_param1,
         NULL
     ),
@@ -4130,6 +4500,13 @@ static IB_CFGMAP_INIT_STRUCTURE(core_config_map) = {
         ""
     ),
     IB_CFGMAP_INIT_ENTRY(
+        "auditlog_index_fmt",
+        IB_FTYPE_NULSTR,
+        &core_global_cfg,
+        auditlog_index_fmt,
+        IB_LOGFORMAT_DEFAULT
+    ),
+    IB_CFGMAP_INIT_ENTRY(
         IB_PROVIDER_TYPE_AUDIT,
         IB_FTYPE_NULSTR,
         &core_global_cfg,
@@ -4150,15 +4527,16 @@ static IB_CFGMAP_INIT_STRUCTURE(core_config_map) = {
     IB_CFGMAP_INIT_LAST
 };
 
+ib_module_t *ib_core_module(void)
+{
+    return IB_MODULE_STRUCT_PTR;
+}
+
 /**
  * @internal
  * Static core module structure.
- *
- * This is a bit of a hack so that the core module can be compiled in (static)
- * but still appear as if it was loaded dynamically.
  */
-IB_MODULE_INIT_STATIC(
-    ib_core_module,                      /**< Static module name */
+IB_MODULE_INIT(
     IB_MODULE_HEADER_DEFAULTS,           /**< Default metadata */
     MODULE_NAME_STR,                     /**< Module name */
     IB_MODULE_CONFIG(&core_global_cfg),  /**< Global config data */

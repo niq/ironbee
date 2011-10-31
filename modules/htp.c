@@ -263,10 +263,21 @@ static int modhtp_htp_request_line(htp_connp_t *connp)
     if ((tx->parsed_uri != NULL) && (tx->parsed_uri->path != NULL)) {
         itx->path = (const char *)bstr_util_strdup_to_c(tx->parsed_uri->path);
     }
+    if (itx->path == NULL) {
+        ib_log_debug(ib, 4, "Unknown URI path - using /");
+        /// @todo Probably should set a flag here
+        itx->path = (const char *)ib_mpool_strdup(itx->mp, "/");
+    }
 
     /* Store the hostname if it was parsed with the URI. */
     if ((tx->parsed_uri != NULL) && (tx->parsed_uri->hostname != NULL)) {
         itx->hostname = (const char *)bstr_util_strdup_to_c(tx->parsed_uri->hostname);
+    }
+    if (itx->hostname == NULL) {
+        ib_log_debug(ib, 4, "Unknown hostname - using ip: %s", iconn->local_ipstr);
+        /// @todo Probably should set a flag here
+        itx->hostname = (const char *)ib_mpool_strdup(itx->mp,
+                                                      iconn->local_ipstr);
     }
 
     /* Fill in a temporary ib_txdata_t structure and use it
@@ -316,9 +327,15 @@ static int modhtp_htp_request_headers(htp_connp_t *connp)
      */
     itx = htp_tx_get_user_data(tx);
 
-    /* Update the hostname. */
-    if (tx->parsed_uri != NULL) {
+    /* Update the hostname that may have changed with headers. */
+    if ((tx->parsed_uri != NULL) && (tx->parsed_uri->hostname != NULL)) {
         itx->hostname = (const char *)bstr_util_strdup_to_c(tx->parsed_uri->hostname);
+    }
+    if (itx->hostname == NULL) {
+        ib_log_debug(ib, 4, "Unknown hostname - using ip: %s", iconn->local_ipstr);
+        /// @todo Probably should set a flag here
+        itx->hostname = (const char *)ib_mpool_strdup(itx->mp,
+                                                      iconn->local_ipstr);
     }
 
     /* Fill in a temporary ib_txdata_t structure for each header line
@@ -728,7 +745,7 @@ static ib_status_t modhtp_iface_init(ib_provider_inst_t *pi,
     int personality;
 
     /* Get the module config. */
-    rc = ib_context_module_config(ctx, &IB_MODULE_SYM, (void *)&modcfg);
+    rc = ib_context_module_config(ctx, IB_MODULE_STRUCT_PTR, (void *)&modcfg);
     if (rc != IB_OK) {
         ib_log_error(ib, 0, "Failed to fetch module %s config: %d",
                      MODULE_NAME_STR, rc);
@@ -967,7 +984,7 @@ static ib_status_t modhtp_iface_gen_request_header_fields(ib_provider_inst_t *pi
     ib_status_t rc;
 
     /* Get the module config. */
-    rc = ib_context_module_config(ctx, &IB_MODULE_SYM, (void *)&modcfg);
+    rc = ib_context_module_config(ctx, IB_MODULE_STRUCT_PTR, (void *)&modcfg);
     if (rc != IB_OK) {
         ib_log_error(ib, 0, "Failed to fetch module %s config: %d",
                      MODULE_NAME_STR, rc);
@@ -1145,7 +1162,7 @@ static ib_status_t modhtp_iface_gen_response_header_fields(ib_provider_inst_t *p
     ib_status_t rc;
 
     /* Get the module config. */
-    rc = ib_context_module_config(ctx, &IB_MODULE_SYM, (void *)&modcfg);
+    rc = ib_context_module_config(ctx, IB_MODULE_STRUCT_PTR, (void *)&modcfg);
     if (rc != IB_OK) {
         ib_log_error(ib, 0, "Failed to fetch module %s config: %d",
                      MODULE_NAME_STR, rc);
@@ -1282,6 +1299,14 @@ static ib_status_t modhtp_context_init(ib_engine_t *ib,
     IB_FTRACE_RET_STATUS(IB_OK);
 }
 
+static ib_status_t modhtp_context_fini(ib_engine_t *ib,
+                                       ib_module_t *m,
+                                       ib_context_t *ctx)
+{
+    IB_FTRACE_INIT(modhtp_context_fini);
+    IB_FTRACE_RET_STATUS(IB_OK);
+}
+
 static IB_CFGMAP_INIT_STRUCTURE(modhtp_config_map) = {
     IB_CFGMAP_INIT_ENTRY(
         MODULE_NAME_STR ".personality",
@@ -1307,5 +1332,6 @@ IB_MODULE_INIT(
     modhtp_init,                         /**< Initialize function */
     modhtp_fini,                         /**< Finish function */
     modhtp_context_init,                 /**< Context init function */
+    modhtp_context_fini                  /**< Context fini function */
 );
 
