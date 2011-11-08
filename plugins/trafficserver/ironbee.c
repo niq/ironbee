@@ -40,6 +40,12 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
+/* Undefine this if using trunk or if the TS-1008 patch is applied
+ * to an earlier version.  Removes the need for the ugly hack of
+ * attaching SSN (connection) initialisation to the first TXN (request).
+ */
+#define HAVE_BUG_1008
+
 // This gets the PRI*64 types
 # define __STDC_FORMAT_MACROS 1
 # include <inttypes.h>
@@ -72,7 +78,11 @@ typedef struct {
   /* store the IPs here so we can clean them up and not leak memory */
   char remote_ip[ADDRSIZE];
   char local_ip[ADDRSIZE];
+#ifdef HAVE_BUG_1008
   TSHttpTxn txnp;	/* hack: conn data requires txnp to access */
+#else
+  TSHttpSsn ssnp;
+#endif
 } ib_ssn_ctx;
 
 typedef struct {
@@ -423,6 +433,8 @@ static int ironbee_plugin(TSCont contp, TSEvent event, void *edata)
   TSHttpSsn ssnp = (TSHttpSsn) edata;
   ib_txn_ctx *txndata;
   ib_ssn_ctx *ssndata;
+  ib_conn_t *iconn = NULL;
+  ib_status_t rc;
 
   TSDebug("ironbee", "Entering ironbee_plugin with %d", event);
   switch (event) {
@@ -439,9 +451,21 @@ static int ironbee_plugin(TSCont contp, TSEvent event, void *edata)
      */
     mycont = TSContCreate(ironbee_plugin, NULL);
     TSHttpSsnHookAdd (ssnp, TS_HTTP_TXN_START_HOOK, mycont);
-    TSContDataSet(mycont, NULL);
 
     TSHttpSsnHookAdd (ssnp, TS_HTTP_SSN_CLOSE_HOOK, mycont);
+#ifndef HAVE_BUG_1008
+    rc = ib_conn_create(ironbee, &iconn, mycont);
+    if (rc != IB_OK) {
+      TSError("ironbee", "ib_conn_create: %d\n", rc);
+      return rc; // FIXME - figure out what to do
+    }
+    ssndata = TSmalloc(sizeof(ib_ssn_ctx));
+    memset(ssndata, 0, sizeof(ib_ssn_ctx));
+    ssndata->iconn = iconn;
+    ssndata->ssnp = ssnp;
+    TSContDataSet(mycont, ssndata);
+    ib_state_notify_conn_opened(ironbee, iconn);
+#endif
 
     TSHttpSsnReenable (ssnp, TS_EVENT_HTTP_CONTINUE);
     break;
@@ -449,9 +473,8 @@ static int ironbee_plugin(TSCont contp, TSEvent event, void *edata)
     /* start of Request */
     /* First req on a connection, we set up conn stuff */
     ssndata = TSContDataGet(contp);
+#ifdef HAVE_BUG_1008
     if (ssndata == NULL) {
-      ib_conn_t *iconn = NULL;
-      ib_status_t rc;
       rc = ib_conn_create(ironbee, &iconn, contp);
       if (rc != IB_OK) {
         TSError("ironbee", "ib_conn_create: %d\n", rc);
@@ -464,6 +487,7 @@ static int ironbee_plugin(TSCont contp, TSEvent event, void *edata)
       TSContDataSet(contp, ssndata);
       ib_state_notify_conn_opened(ironbee, iconn);
     }
+#endif
 
     /* create a txn cont (request ctx) */
     mycont = TSContCreate(ironbee_plugin, NULL);
@@ -647,7 +671,11 @@ static ib_status_t ironbee_conn_init(ib_engine_t *ib,
 //  ib_clog_debug(....);
 
   /* remote ip */
+#ifdef HAVE_BUG_1008
   addr = TSHttpTxnClientAddrGet(data->txnp);
+#else
+  addr = TSHttpSsnClientAddrGet(data->ssnp);
+#endif
 
   addr2str(addr, data->remote_ip, &port);
 
@@ -669,7 +697,11 @@ static ib_status_t ironbee_conn_init(ib_engine_t *ib,
     }
 
   /* local end */
+#ifdef HAVE_BUG_1008
   addr = TSHttpTxnIncomingAddrGet(data->txnp);
+#else
+  addr = TSHttpSsnIncomingAddrGet(data->ssnp);
+#endif
 
   addr2str(addr, data->local_ip, &port);
 

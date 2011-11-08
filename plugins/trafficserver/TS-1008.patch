@@ -1,0 +1,103 @@
+--- proxy/api/ts/ts.h.in	2011/11/04 10:52:05	1197498
++++ proxy/api/ts/ts.h.in	2011/11/04 10:55:04	1197499
+@@ -2147,7 +2147,13 @@
+ 
+   tsapi TSReturnCode TSHttpTxnClientFdGet(TSHttpTxn txnp, int* fdp);
+   tsapi TSReturnCode TSHttpTxnOutgoingAddrSet(TSHttpTxn txnp, struct sockaddr const* addr);
+-  
++
++  /* TS-1008: the above TXN calls for the Client conn should work with SSN */
++  tsapi struct sockaddr const* TSHttpSsnClientAddrGet(TSHttpSsn ssnp);
++  tsapi struct sockaddr const* TSHttpSsnIncomingAddrGet(TSHttpSsn ssnp);
++  tsapi TSReturnCode TSHttpSsnClientFdGet(TSHttpSsn ssnp, int* fdp);
++  /* TS-1008 END */
++
+   /** @deprecated Use TSHttpTxnClientAddrGet */
+   tsapi TS_DEPRECATED unsigned int TSHttpTxnClientIPGet(TSHttpTxn txnp);
+   /** @deprecated Use TSHttpTxnClientAddrGet */
+--- proxy/InkAPI.cc	2011/11/04 10:52:05	1197498
++++ proxy/InkAPI.cc	2011/11/04 10:55:04	1197499
+@@ -5143,11 +5143,8 @@
+ }
+ 
+ sockaddr const*
+-TSHttpTxnClientAddrGet(TSHttpTxn txnp)
++TSHttpSsnClientAddrGet(TSHttpSsn ssnp)
+ {
+-  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+- 
+-  TSHttpSsn ssnp = TSHttpTxnSsnGet(txnp);
+   HttpClientSession *cs = reinterpret_cast<HttpClientSession *>(ssnp);
+ 
+   if (cs == NULL) return 0;
+@@ -5157,6 +5154,14 @@
+ 
+   return vc->get_remote_addr();
+ }
++sockaddr const*
++TSHttpTxnClientAddrGet(TSHttpTxn txnp)
++{
++  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
++ 
++  TSHttpSsn ssnp = TSHttpTxnSsnGet(txnp);
++  return TSHttpSsnClientAddrGet(ssnp);
++}
+ 
+ unsigned int
+ TSHttpTxnClientIPGet(TSHttpTxn txnp)
+@@ -5168,10 +5173,7 @@
+ }
+ 
+ sockaddr const*
+-TSHttpTxnIncomingAddrGet(TSHttpTxn txnp) {
+-  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+- 
+-  TSHttpSsn ssnp = TSHttpTxnSsnGet(txnp);
++TSHttpSsnIncomingAddrGet(TSHttpSsn ssnp) {
+   HttpClientSession *cs = reinterpret_cast<HttpClientSession *>(ssnp);
+ 
+   if (cs == NULL) return 0;
+@@ -5181,6 +5183,13 @@
+ 
+   return vc->get_local_addr();
+ }
++sockaddr const*
++TSHttpTxnIncomingAddrGet(TSHttpTxn txnp) {
++  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
++ 
++  TSHttpSsn ssnp = TSHttpTxnSsnGet(txnp);
++  return TSHttpSsnIncomingAddrGet(ssnp);
++}
+ 
+ int
+ TSHttpTxnClientIncomingPortGet(TSHttpTxn txnp)
+@@ -6768,12 +6777,10 @@
+ }
+ 
+ TSReturnCode
+-TSHttpTxnClientFdGet(TSHttpTxn txnp, int *fdp)
++TSHttpSsnClientFdGet(TSHttpSsn ssnp, int *fdp)
+ {
+-  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
+   sdk_assert(sdk_sanity_check_null_ptr((void*)fdp) == TS_SUCCESS);
+ 
+-  TSHttpSsn ssnp = TSHttpTxnSsnGet(txnp);
+   HttpClientSession *cs = (HttpClientSession *) ssnp;
+ 
+   if (cs == NULL)
+@@ -6786,6 +6793,15 @@
+   *fdp = vc->get_socket();
+   return TS_SUCCESS;
+ }
++TSReturnCode
++TSHttpTxnClientFdGet(TSHttpTxn txnp, int *fdp)
++{
++  sdk_assert(sdk_sanity_check_txn(txnp) == TS_SUCCESS);
++  sdk_assert(sdk_sanity_check_null_ptr((void*)fdp) == TS_SUCCESS);
++
++  TSHttpSsn ssnp = TSHttpTxnSsnGet(txnp);
++  return TSHttpSsnClientFdGet(ssnp, fdp);
++}
+ 
+ TSReturnCode
+ TSHttpTxnClientRemotePortGet(TSHttpTxn txnp, int *portp)
